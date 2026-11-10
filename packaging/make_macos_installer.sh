@@ -17,9 +17,11 @@ cp -R "$ART/Standalone/WaveSurfer.app" "$STAGE/root/Applications/"
 pkgbuild --analyze --root "$STAGE/root" "$STAGE/components.plist"
 i=0
 while /usr/libexec/PlistBuddy -c "Print :$i" "$STAGE/components.plist" >/dev/null 2>&1; do
-  /usr/libexec/PlistBuddy -c "Set :$i:BundleIsRelocatable false" "$STAGE/components.plist"
+  /usr/libexec/PlistBuddy -c "Delete :$i:BundleIsRelocatable" "$STAGE/components.plist" 2>/dev/null || true
+  /usr/libexec/PlistBuddy -c "Add :$i:BundleIsRelocatable bool false" "$STAGE/components.plist"
   i=$((i + 1))
 done
+echo "Marked $i bundle(s) non-relocatable"
 
 pkgbuild --root "$STAGE/root" \
          --component-plist "$STAGE/components.plist" \
