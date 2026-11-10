@@ -30,7 +30,12 @@ Built from the SpectralUnmasker header: kept its structure, fixed its bugs, adde
   Worst block ≤ 1.04x average (no spikes).
 - Bit-exact null at default settings and at Amount 0. Output is bit-identical for block sizes 1…8192.
 
+### macOS CI (GitHub Actions, macos-15, 2026-11-10)
+- Universal (arm64 + x86_64) VST3/AU/Standalone built against JUCE d60b7a7, x86_64 slice min macOS 10.13.
+- Same stress test 42/42, VST3 host test 12/12, `auval -strict`: AU VALIDATION SUCCEEDED.
+- Release v1.0.0 published by CI: WaveSurfer-1.0.0-macOS.pkg + .zip (ad-hoc signed, not notarised).
+
 ### Not yet verified
-- macOS AU/VST3 builds and High Sierra runtime (built and tested on Linux only).
+- Runtime on a real High Sierra machine and in DAWs (Logic, Ableton, Reaper...).
 - Real-mix listening and tuning of the gain-law constants (RECOVER_SLOPE, TAME_SLOPE, TAME_DEADZONE).
 - Side-only (L = −R) material: detection uses Mid, so pure side content is left untouched (by design, for now).

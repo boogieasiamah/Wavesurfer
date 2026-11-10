@@ -38,3 +38,7 @@ Brand: Quantum Research Audio. Free/research release.
 13. Use the exact digital bell response for the GUI curve: w = tan(πf/fs)/tan(πfc/fs), H = (1−w²+jkA²w)/(1−w²+jkw).
     Verified against the simulated filter to 0.004 dB.
 14. Xcode 27 drops deployment targets below macOS 12. Keep an older Xcode for High Sierra builds.
+15. pkgbuild --analyze doesn't always write BundleIsRelocatable. Delete then Add it (bool false), or the installer
+    may "relocate" a plugin into some other copy on the user's disk.
+16. In packaging scripts, make output paths absolute before any `cd`. A relative zip path silently went to a temp dir.
+17. Let CI publish releases (GITHUB_TOKEN inside Actions); keep the version in CMakeLists.txt as the single source.
