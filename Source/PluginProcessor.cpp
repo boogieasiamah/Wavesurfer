@@ -20,9 +20,12 @@ WaveSurferProcessor::WaveSurferProcessor()
     pDelta    = apvts.getRawParameterValue("delta");
     pBypass   = apvts.getRawParameterValue("bypass");
     pClip     = apvts.getRawParameterValue("clip");
+    pOutput   = apvts.getRawParameterValue("output");
+    pReference= apvts.getRawParameterValue("reference");
+    pLookahead= apvts.getRawParameterValue("lookahead");
     bypassParam = apvts.getParameter("bypass");
     jassert(pRecover && pTame && pBias && pBrighten && pBoost && pAmount && pLow && pHigh
-            && pGainMatch && pDelta && pBypass && pClip && bypassParam);
+            && pGainMatch && pDelta && pBypass && pClip && pOutput && pReference && pLookahead && bypassParam);
 }
 
 juce::AudioProcessorValueTreeState::ParameterLayout WaveSurferProcessor::createParameterLayout()
@@ -35,26 +38,33 @@ juce::AudioProcessorValueTreeState::ParameterLayout WaveSurferProcessor::createP
         [](float v, int) { auto n = juce::roundToInt(v * 100.0f); return (n > 0 ? "+" : "") + String(n) + "%"; });
     auto db = AudioParameterFloatAttributes().withStringFromValueFunction(
         [](float v, int) { return (v > 0.0f ? "+" : "") + String(v, 1) + " dB"; });
+    auto dbInt = AudioParameterFloatAttributes().withStringFromValueFunction(
+        [](float v, int) { const int n = juce::roundToInt(v); return (n > 0 ? "+" : "") + String(n) + " dB"; });
     auto hz = AudioParameterFloatAttributes().withStringFromValueFunction(
         [](float v, int) { return v >= 1000.0f ? String(v / 1000.0f, 1) + " kHz" : String(juce::roundToInt(v)) + " Hz"; });
 
     layout.add(std::make_unique<AudioParameterFloat>(ParameterID{"recover", 1}, "Recover",
-        NormalisableRange<float>(0.0f, 1.0f), 0.0f, pct));
+        NormalisableRange<float>(0.0f, 2.0f), 0.0f, pct));
     layout.add(std::make_unique<AudioParameterFloat>(ParameterID{"tame", 1}, "Tame",
-        NormalisableRange<float>(0.0f, 1.0f), 0.0f, pct));
+        NormalisableRange<float>(0.0f, 2.0f), 0.0f, pct));
     layout.add(std::make_unique<AudioParameterFloat>(ParameterID{"bias", 1}, "Bias",
         NormalisableRange<float>(-1.0f, 1.0f), 0.0f, bip));
     layout.add(std::make_unique<AudioParameterFloat>(ParameterID{"brighten", 1}, "Brighten",
         NormalisableRange<float>(-1.0f, 1.0f), 0.0f, bip));
     layout.add(std::make_unique<AudioParameterFloat>(ParameterID{"boost", 1}, "Boost",
+        NormalisableRange<float>(-50.0f, 50.0f), 0.0f, dbInt));
+    layout.add(std::make_unique<AudioParameterFloat>(ParameterID{"output", 1}, "Output",
         NormalisableRange<float>(-12.0f, 12.0f), 0.0f, db));
+    layout.add(std::make_unique<AudioParameterChoice>(ParameterID{"reference", 1}, "Reference",
+        StringArray { "Ear (ISO 226)", "Pink Noise" }, 0));
+    layout.add(std::make_unique<AudioParameterBool>(ParameterID{"lookahead", 1}, "Lookahead", false));
     layout.add(std::make_unique<AudioParameterFloat>(ParameterID{"amount", 1}, "Amount",
         NormalisableRange<float>(0.0f, 1.0f), 1.0f, pct));
     layout.add(std::make_unique<AudioParameterFloat>(ParameterID{"lowLimit", 1}, "Low Limit",
         NormalisableRange<float>(20.0f, 2000.0f, 0.0f, 0.3f), 20.0f, hz));
     layout.add(std::make_unique<AudioParameterFloat>(ParameterID{"highLimit", 1}, "High Limit",
         NormalisableRange<float>(1000.0f, 20000.0f, 0.0f, 0.3f), 20000.0f, hz));
-    layout.add(std::make_unique<AudioParameterBool>(ParameterID{"gainMatch", 1}, "Gain Match", false));
+    layout.add(std::make_unique<AudioParameterBool>(ParameterID{"gainMatch", 1}, "Loudness Match", true));
     layout.add(std::make_unique<AudioParameterBool>(ParameterID{"delta", 1}, "Delta", false));
     layout.add(std::make_unique<AudioParameterBool>(ParameterID{"bypass", 1}, "Bypass", false));
     layout.add(std::make_unique<AudioParameterBool>(ParameterID{"clip", 1}, "Safety Clip", false));
@@ -64,7 +74,9 @@ juce::AudioProcessorValueTreeState::ParameterLayout WaveSurferProcessor::createP
 void WaveSurferProcessor::prepareToPlay(double sampleRate, int samplesPerBlock)
 {
     engine.prepare(sampleRate, samplesPerBlock);   // sets fs, snaps smoothers on first block
-    setLatencySamples(0);
+    reportedLatency = pLookahead->load() > 0.5f ? engine.getLookaheadSamples() : 0;
+    pendingLatency = reportedLatency;
+    setLatencySamples(reportedLatency);
 }
 
 bool WaveSurferProcessor::isBusesLayoutSupported(const BusesLayout& layouts) const
@@ -95,7 +107,14 @@ void WaveSurferProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce::M
     p.delta      = pDelta->load(std::memory_order_relaxed) > 0.5f;
     p.bypass     = pBypass->load(std::memory_order_relaxed) > 0.5f;
     p.safetyClip = pClip->load(std::memory_order_relaxed) > 0.5f;
+    p.outputDb   = pOutput->load(std::memory_order_relaxed);
+    p.reference  = pReference->load(std::memory_order_relaxed) > 0.5f ? wavesurfer::Reference::Pink : wavesurfer::Reference::Ear;
+    p.lookahead  = pLookahead->load(std::memory_order_relaxed) > 0.5f;
     engine.setParameters(p);
+
+    // lookahead changes the latency: tell the host from the message thread
+    const int lat = engine.getLatencySamples();
+    if (lat != reportedLatency) { reportedLatency = lat; pendingLatency = lat; triggerAsyncUpdate(); }
 
     const int nch = juce::jmin(numIn, numOut, buffer.getNumChannels(), 2);
     engine.process(buffer.getArrayOfWritePointers(), nch, buffer.getNumSamples());

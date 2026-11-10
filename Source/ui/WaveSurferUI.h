@@ -27,6 +27,7 @@ namespace Pal {
     const Colour blue    { 0xFF4C7DFF };
     const Colour coral   { 0xFFFF5C7A };
     const Colour amber   { 0xFFFFC266 };
+    const Colour pink    { 0xFFFF8CC6 };
 }
 
 // ------------------------------------------------------------------ theme ----
@@ -213,6 +214,49 @@ private:
     std::unique_ptr<AudioProcessorValueTreeState::SliderAttachment> attachment;
 };
 
+// ------------------------------------------------------------- segmented ----
+// LANDR-style segmented switch bound to a choice parameter
+class Segmented : public Component, public SettableTooltipClient {
+public:
+    Segmented(Theme& t, RangedAudioParameter& p, StringArray labels)
+        : theme(t), names(std::move(labels)),
+          attachment(p, [this](float v) { index = roundToInt(v); repaint(); })
+    {
+        attachment.sendInitialUpdate();
+    }
+
+    void paint(Graphics& g) override {
+        const auto r = getLocalBounds().toFloat().reduced(0.5f);
+        const float rad = r.getHeight() * 0.5f;
+        g.setColour(Pal::panelHi); g.fillRoundedRectangle(r, rad);
+        g.setColour(Pal::border.brighter(0.15f)); g.drawRoundedRectangle(r, rad, 1.0f);
+        const float w = r.getWidth() / (float) names.size();
+        for (int i = 0; i < names.size(); ++i) {
+            auto seg = Rectangle<float>(r.getX() + w * (float) i, r.getY(), w, r.getHeight()).reduced(3.0f);
+            const bool on = i == index;
+            if (on) {
+                g.setColour(Pal::teal.withAlpha(0.16f)); g.fillRoundedRectangle(seg.expanded(2.0f), seg.getHeight() * 0.5f + 2.0f);
+                ColourGradient grad(Pal::blue, seg.getTopLeft(), Pal::teal, seg.getBottomRight(), false);
+                g.setGradientFill(grad); g.fillRoundedRectangle(seg, seg.getHeight() * 0.5f);
+            }
+            g.setFont(theme.font(theme.semibold, 11.0f, 0.08f));
+            g.setColour(on ? Colour(0xFF06101F) : Pal::dim);
+            g.drawText(names[i].toUpperCase(), seg, Justification::centred);
+        }
+    }
+
+    void mouseDown(const MouseEvent& e) override {
+        const int i = jlimit(0, names.size() - 1, (int) ((float) e.x / ((float) getWidth() / (float) names.size())));
+        attachment.setValueAsCompleteGesture((float) i);
+    }
+
+private:
+    Theme& theme;
+    StringArray names;
+    ParameterAttachment attachment;
+    int index = 0;
+};
+
 // ---------------------------------------------------------------- display ----
 class Display : public Component {
 public:
@@ -254,6 +298,7 @@ public:
         gmOn = *proc.apvts.getRawParameterValue("gainMatch") > 0.5f;
         deltaOn = *proc.apvts.getRawParameterValue("delta") > 0.5f;
         bypassOn = *proc.apvts.getRawParameterValue("bypass") > 0.5f;
+        pinkMode = s.reference.load(std::memory_order_relaxed) == 1;
         topHz = s.sampleRate.load(std::memory_order_relaxed) * 0.45f;
         repaint();
     }
@@ -278,6 +323,7 @@ public:
             g.reduceClipRegion(plot.toNearestInt().expanded(0, 2));
             drawGrid(g, plot);
             drawSpectrum(g, plot);
+            if (pinkMode) drawPinkTarget(g, plot);
             drawLimits(g, plot);
             drawCurve(g, plot);
         }
@@ -372,6 +418,20 @@ private:
         g.strokePath(line, PathStrokeType(1.2f));
     }
 
+    // Pink mode: the flat line the long-term balance is pulled toward (mean level inside the limits)
+    void drawPinkTarget(Graphics& g, Rectangle<float>) {
+        const float lo = jmin(lowHz(), highHz()), hi = jmax(lowHz(), highHz());
+        float sum = 0.0f; int n = 0;
+        for (int b = 0; b < NB; ++b) if (freqs[b] >= lo && freqs[b] <= hi && spec[b] > -100.0f) { sum += spec[b]; ++n; }
+        if (n == 0) return;
+        const float y = ySpec(sum / (float) n);
+        const float dash[] = { 6.0f, 5.0f };
+        g.setColour(Pal::pink.withAlpha(0.75f));
+        g.drawDashedLine(Line<float>(xOf(lo), y, xOf(hi), y), dash, 2, 1.4f);
+        g.setFont(theme.font(theme.semibold, 9.5f, 0.12f));
+        g.drawText("PINK TARGET", Rectangle<float>(xOf(lo) + 10, y - 16, 90, 12), Justification::centredLeft);
+    }
+
     void drawLimits(Graphics& g, Rectangle<float> p) {
         const float lx = xOf(jmin(lowHz(), highHz())), hx = xOf(jmax(lowHz(), highHz()));
         if (lx > p.getX() + 0.5f) {
@@ -456,8 +516,8 @@ private:
         g.setFont(theme.font(theme.semibold, 9.5f, 0.12f));
         float x = p.getRight() - 14.0f;            // badges sit bottom-right, clear of the low handle
         if (gmOn) {
-            const String s = "MATCH " + String(gmDb >= 0 ? "+" : "") + String(gmDb, 1) + " dB";
-            x -= 112; drawBadge(g, { x, p.getBottom() - 28, 112, 18 }, s, Pal::teal); x -= 8;
+            const String s = "LOUDNESS " + String(gmDb >= 0 ? "+" : "") + String(gmDb, 1) + " dB";
+            x -= 132; drawBadge(g, { x, p.getBottom() - 28, 132, 18 }, s, Pal::teal); x -= 8;
         }
         if (deltaOn) { x -= 64; drawBadge(g, { x, p.getBottom() - 28, 64, 18 }, "DELTA", Pal::amber); }
         if (bypassOn) {
@@ -514,7 +574,7 @@ private:
     float freqs[NB] {}, spec[NB] {}, curve[NPTS] {};
     float meter[4] {}, hold[4] {}; int holdAge[4] {};
     float gmDb = 0.0f, topHz = 20000.0f;
-    bool gmOn = false, deltaOn = false, bypassOn = false;
+    bool gmOn = false, deltaOn = false, bypassOn = false, pinkMode = false;
     int dragging = 0;
 };
 
@@ -534,6 +594,24 @@ inline void drawLogo(Graphics& g, Rectangle<float> r) {
     g.strokePath(wave, PathStrokeType(w * 0.095f, PathStrokeType::curved, PathStrokeType::rounded));
     Path base; base.startNewSubPath(x + w * 0.14f, y + h * 0.82f); base.lineTo(x + w * 0.86f, y + h * 0.82f);
     g.strokePath(base, PathStrokeType(w * 0.06f, PathStrokeType::curved, PathStrokeType::rounded));
+}
+
+// --------------------------------------------------- centre-zero meter ----
+// Gullfoss-style activity meter: left value grows left, right value grows right.
+inline void drawCentreMeter(Graphics& g, const Theme& th, Rectangle<float> r, const String& leftLabel, const String& rightLabel,
+                            float leftAmount, float rightAmount, Colour leftCol, Colour rightCol) {
+    g.setFont(th.caps(8.5f));
+    g.setColour(Pal::faint.brighter(0.2f));
+    g.drawText(leftLabel,  r.withHeight(11), Justification::centredLeft);
+    g.drawText(rightLabel, r.withHeight(11), Justification::centredRight);
+    auto track = Rectangle<float>(r.getX(), r.getBottom() - 5.0f, r.getWidth(), 4.0f);
+    g.setColour(Pal::grid); g.fillRoundedRectangle(track, 2.0f);
+    const float cx = track.getCentreX(), half = track.getWidth() * 0.5f;
+    const float l = jlimit(0.0f, 1.0f, leftAmount) * half, rr = jlimit(0.0f, 1.0f, rightAmount) * half;
+    if (l > 0.5f)  { g.setColour(leftCol);  g.fillRoundedRectangle(track.withX(cx - l).withWidth(l), 2.0f); }
+    if (rr > 0.5f) { g.setColour(rightCol); g.fillRoundedRectangle(track.withX(cx).withWidth(rr), 2.0f); }
+    g.setColour(Pal::text.withAlpha(0.6f));
+    g.fillRect(cx - 0.5f, track.getY() - 2.0f, 1.0f, track.getHeight() + 4.0f);
 }
 
 } // namespace wsui

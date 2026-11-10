@@ -1,5 +1,20 @@
 # WaveSurfer — progress
 
+## v1.1 (2026-11-10)
+Researched how Gullfoss' Recover/Tame behave (manual + reviews) and closed the gaps.
+- Recover/Tame 0–200% (old values load unchanged; 30–50% is the gentle zone).
+- Reference switch: **Ear (ISO 226)** or **Pink Noise** (long-term balance, power-averaged, analytically calibrated,
+  doesn't fill intentionally empty regions like a high-passed sub).
+- Bias now moves the Recover/Tame split (matters even with only Recover). Brighten does nothing alone, tilts the
+  split by frequency, and drives a Darker/Brighter meter. Recover/Tame activity meter added.
+- Boost = listening level on the ISO 226 contours (±50 dB, global); old output gain moved to new **Output**.
+- Loudness match on by default, predictive and K-weighted (within 0.4 dB in tests).
+- Optional 20 ms lookahead, latency reported to the host; bypass and Amount 0 are bit-exact with it on.
+- Tests: 73/73 DSP checks (ASan/UBSan clean), host test 14/14, editor stress 5/5, zero warnings.
+- Bugs the new tests caught: dB-averaging bias (pink read 3–5 dB low in the lows), lookahead bypass off by float
+  rounding, loudness prediction overshoot (1.3–1.7 dB), Brighten too weak (0.09 Bark range, now −0.20…+0.52 Bark).
+- CPU unchanged: ~0.6% of one core at 48 kHz with everything on.
+
 ## v1.0 (2026-11-10)
 Built from the SpectralUnmasker header: kept its structure, fixed its bugs, added the missing pieces, renamed it WaveSurfer.
 

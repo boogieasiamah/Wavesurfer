@@ -5,10 +5,12 @@
 // ==============================================================================
 // WAVESURFER — audio processor
 // Parameter IDs from the original SpectralUnmasker are kept (recover, tame, bias,
-// brighten, boost, amount, lowLimit, highLimit). Brighten is now bipolar (-1..1,
-// default 0, so old sessions load unchanged). New: gainMatch, delta, bypass, clip.
+// brighten, boost, amount, lowLimit, highLimit).
+// v1.1: Recover/Tame go to 200%; Boost is a listening-level shift (ISO 226, +-50 dB);
+// new: output, reference (Ear/Pink), lookahead, gainMatch (loudness, default on),
+// delta, bypass, clip.
 // ==============================================================================
-class WaveSurferProcessor : public juce::AudioProcessor {
+class WaveSurferProcessor : public juce::AudioProcessor, private juce::AsyncUpdater {
 public:
     WaveSurferProcessor();
     ~WaveSurferProcessor() override = default;
@@ -36,6 +38,7 @@ public:
     void setStateInformation(const void* data, int sizeInBytes) override;
 
     juce::AudioProcessorParameter* getBypassParameter() const override { return bypassParam; }
+    void handleAsyncUpdate() override { setLatencySamples(pendingLatency.load()); }
 
     const wavesurfer::WaveSurferEngine& getEngine() const noexcept { return engine; }
     // Fresh responseDb from the engine's published bell gains (message-thread safe).
@@ -53,6 +56,10 @@ private:
     std::atomic<float>* pLow = nullptr;     std::atomic<float>* pHigh = nullptr;
     std::atomic<float>* pGainMatch = nullptr; std::atomic<float>* pDelta = nullptr;
     std::atomic<float>* pBypass = nullptr;  std::atomic<float>* pClip = nullptr;
+    std::atomic<float>* pOutput = nullptr;  std::atomic<float>* pReference = nullptr;
+    std::atomic<float>* pLookahead = nullptr;
+    std::atomic<int> pendingLatency { 0 };
+    int reportedLatency = 0;
     juce::AudioProcessorParameter* bypassParam = nullptr;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(WaveSurferProcessor)

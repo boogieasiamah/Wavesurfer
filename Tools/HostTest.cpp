@@ -118,7 +118,7 @@ int main(int argc, char** argv)
     });
     bool editorsOk = true;
     for (int k = 0; k < 5; ++k) {
-        std::unique_ptr<juce::AudioProcessorEditor> ed(plugin->createEditorIfNeeded());
+        std::unique_ptr<juce::AudioProcessorEditor> ed(plugin->createEditorAndMakeActive());
         if (! ed) { editorsOk = false; break; }
         std::printf("  editor %d: %dx%d\n", k, ed->getWidth(), ed->getHeight());
         for (int t = 0; t < 20; ++t) {
@@ -129,6 +129,28 @@ int main(int argc, char** argv)
     run = false; audio.join();
     EXPECT(editorsOk, "editor created every time");
     EXPECT(audioFinite.load(), "audio stayed finite while parameters were hammered");
+
+    // 5) lookahead: the DAW must be told about the 20 ms latency, and back to 0
+    std::puts("[H5] lookahead latency reported to the host");
+    {
+        juce::AudioProcessorParameter* look = nullptr;
+        for (auto* p : params) if (p->getName(64) == "Lookahead") look = p;
+        EXPECT(look != nullptr, "Lookahead parameter exposed");
+        if (look) {
+            plugin->prepareToPlay(48000, 512);
+            auto settle = [&](float v) {
+                look->setValueNotifyingHost(v);
+                for (int t = 0; t < 30; ++t) {
+                    juce::AudioBuffer<float> b(2, 512); b.clear(); plugin->processBlock(b, midi);
+                    juce::MessageManager::getInstance()->runDispatchLoopUntil(5);
+                }
+                return plugin->getLatencySamples();
+            };
+            const int on = settle(1.0f), off = settle(0.0f);
+            std::printf("  latency with lookahead: %d samples, without: %d\n", on, off);
+            EXPECT(on == 960 && off == 0, "host sees lookahead latency changes");
+        }
+    }
 
     plugin->releaseResources();
     plugin.reset();

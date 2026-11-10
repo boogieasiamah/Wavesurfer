@@ -77,7 +77,25 @@ static double rmsDb(const std::vector<float>& v, int from = 0) { double s = 0; f
 static float maxDiff(const std::vector<float>& v, int from = 0) { float m = 0; for (size_t i = std::max(1, from); i < v.size(); ++i) m = std::max(m, std::abs(v[i] - v[i - 1])); return m; }
 
 static Params P(float rec, float tam, float bias, float bri, float boost, float amt, float lo = 20, float hi = 20000) {
-    Params p; p.recover = rec; p.tame = tam; p.bias = bias; p.brighten = bri; p.boostDb = boost; p.amount = amt; p.lowHz = lo; p.highHz = hi; return p;
+    Params p; p.recover = rec; p.tame = tam; p.bias = bias; p.brighten = bri; p.boostDb = boost; p.amount = amt; p.lowHz = lo; p.highHz = hi;
+    p.gainMatch = false; return p;
+}
+
+// ITU-R BS.1770 K-weighted loudness (48 kHz coefficients), stereo sum, dB
+static double kLoudness(const std::vector<float>& L, const std::vector<float>& R, int from) {
+    auto kw = [](const std::vector<float>& x, int from_) {
+        double s1[2] = {0,0}, s2[2] = {0,0}, acc = 0;
+        const double b0 = 1.53512485958697, b1 = -2.69169618940638, b2 = 1.19839281085285, a1 = -1.69065929318241, a2 = 0.73248077421585;
+        const double c1 = -1.99004745483398, c2 = 0.99007225036621;
+        double x1 = 0, x2 = 0, y1 = 0, y2 = 0, z1 = 0, z2 = 0, w1 = 0, w2 = 0; (void) s1; (void) s2;
+        for (size_t i = 0; i < x.size(); ++i) {
+            double y = b0 * x[i] + b1 * x1 + b2 * x2 - a1 * y1 - a2 * y2; x2 = x1; x1 = x[i]; y2 = y1; y1 = y;
+            double z = y - 2 * w1 + w2 - c1 * z1 - c2 * z2; w2 = w1; w1 = y; z2 = z1; z1 = z;
+            if ((int) i >= from_) acc += z * z;
+        }
+        return acc / std::max<size_t>(1, x.size() - from_);
+    };
+    return -0.691 + 10 * std::log10(kw(L, from) + kw(R, from) + 1e-30);
 }
 
 // ================================================================== tests ====
@@ -143,7 +161,7 @@ static void testNull() {
     for (int pass = 0; pass < 2; ++pass) {
         WaveSurferEngine e; e.prepare(48000); std::vector<float> L, R; gen(Sig::Pink, 48000, 48000 * 3, L, R);
         auto L0 = L, R0 = R;
-        Params p = pass == 0 ? Params{} : P(1, 1, 1, 1, 0, 0, 20, 20000);
+        Params p = pass == 0 ? Params{} : P(2, 2, 1, 1, 50, 0, 20, 20000);
         if (pass == 1) { e.setParameters(P(1, 1, 1, 1, 0, 1)); std::vector<float> a = L, b = R; run(e, a, b, 512); } // get it busy first
         e.setParameters(p);
         run(e, L, R, 0);
@@ -154,8 +172,8 @@ static void testNull() {
 }
 
 static void testExtremeGrid() {
-    std::puts("[T05] all 256 parameter corners x 6 signals x random toggles (finite, bounded, clip ceiling)");
-    const float corners[8][2] = { {0,1}, {0,1}, {-1,1}, {-1,1}, {-12,12}, {0,1}, {20,2000}, {1000,20000} };
+    std::puts("[T05] all 256 parameter corners x 6 signals x random toggles/modes (finite, bounded, clip ceiling)");
+    const float corners[8][2] = { {0,2}, {0,2}, {-1,1}, {-1,1}, {-50,50}, {0,1}, {20,2000}, {1000,20000} };
     const Sig sigs[] = { Sig::Pink, Sig::Sine1k, Sig::Hot, Sig::Square, Sig::Impulse, Sig::PinkPlusTone };
     int runs = 0, bad = 0; float worstGainDb = -999; Rng tog;
     for (int c = 0; c < 256; ++c)
@@ -164,6 +182,8 @@ static void testExtremeGrid() {
             Params p; float v[8]; for (int k = 0; k < 8; ++k) v[k] = corners[k][(c >> k) & 1];
             p = P(v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7]);
             p.gainMatch = tog.next() > 0; p.delta = tog.next() > 0.6f; p.safetyClip = tog.next() > 0;
+            p.reference = tog.next() > 0 ? Reference::Pink : Reference::Ear; p.lookahead = tog.next() > 0;
+            p.outputDb = tog.next() > 0 ? 12.0f : -12.0f;
             e.setParameters(p);
             std::vector<float> L, R; gen(s, 48000, 24000, L, R, c + 1); float inPk = std::max(peak(L), peak(R));
             run(e, L, R, 0, true, nullptr, c);
@@ -173,7 +193,7 @@ static void testExtremeGrid() {
             if (p.safetyClip && outPk > 1.0f) ok = false;
             float gdb = 20 * std::log10((outPk + 1e-12f) / (inPk + 1e-12f));
             if (!p.delta) worstGainDb = std::max(worstGainDb, gdb);
-            if (gdb > 45.0f) ok = false;   // +15 EQ +12 match +12 boost + overlap margin
+            if (gdb > 60.0f) ok = false;   // +18 bell +12 match +12 output + overlap margin
             if (!ok) { ++bad; if (bad < 6) std::printf("    bad corner %d sig %s outPk %g\n", c, sigName(s), outPk); }
         }
     std::printf("    %d runs, worst peak gain %.1f dB\n", runs, worstGainDb);
@@ -201,10 +221,13 @@ static void testRatesBlocks() {
     const double rates[] = { 22050, 44100, 48000, 88200, 96000, 176400, 192000, 352800, 384000 };
     const int blocks[] = { 1, 3, 32, 64, 441, 512, 4096, 8192, 0 };
     int mism = 0, nonfin = 0, total = 0;
-    for (double fs : rates) {
+    for (int ri = 0; ri < 9; ++ri) {
+        const double fs = rates[ri];
         std::vector<float> refL, refR;
         for (int bs : blocks) {
-            WaveSurferEngine e; e.prepare(fs, bs); e.setParameters(P(0.8f, 0.6f, 0.2f, 0.3f, 3, 1));
+            WaveSurferEngine e; e.prepare(fs, bs); Params p = P(1.6f, 1.2f, 0.2f, 0.3f, 10, 1); p.gainMatch = true;
+            p.reference = ri % 2 ? Reference::Pink : Reference::Ear; p.lookahead = ri % 3 == 0;
+            e.setParameters(p);
             std::vector<float> L, R; gen(Sig::PinkPlusTone, fs, (int)(fs * 0.6), L, R);
             run(e, L, R, bs); ++total;
             if (!allFinite(L) || !allFinite(R)) ++nonfin;
@@ -227,7 +250,8 @@ static void testAutomation() {
     run(e, L, R, 64, true, [&](int) {
         Params p = P(r.next() * .5f + .5f, r.next() * .5f + .5f, r.next(), r.next(), r.next() * 12, r.next() * .5f + .5f,
                      20 + (r.next() * .5f + .5f) * 1980, 1000 + (r.next() * .5f + .5f) * 19000);
-        p.bypass = r.next() > 0.8f; p.delta = false; p.gainMatch = r.next() > 0; e.setParameters(p); });
+        p.bypass = r.next() > 0.8f; p.delta = false; p.gainMatch = r.next() > 0;
+        p.reference = r.next() > 0 ? Reference::Pink : Reference::Ear; p.outputDb = 0; e.setParameters(p); });
     float dOut = maxDiff(L, 4800);
     std::printf("    max step in %.4f, out %.4f (ratio %.2f; boost+EQ allow up to ~%.1fx)\n", dIn, dOut, dOut / dIn, std::pow(10.0, 27 / 20.0));
     CHECK(allFinite(L) && allFinite(R), "non-finite under automation");
@@ -282,7 +306,7 @@ static void testSilenceAfterLoud() {
     std::vector<float> L, R; gen(Sig::Pink, 48000, 48000 * 4, L, R);
     for (size_t i = 48000; i < L.size(); ++i) { L[i] *= 3e-6f; R[i] *= 3e-6f; } // -110 dBFS
     auto L0 = L; run(e, L, R, 512);
-    float m = 0; for (int b = 0; b < 32; ++b) m = std::max(m, std::abs(e.getBandGainDb(b)) - std::abs(3.0f * std::clamp((float)std::log2(e.getBandFreq(b) / 1000) / 4, -1.f, 1.f)));
+    float m = 0; for (int b = 0; b < 32; ++b) m = std::max(m, std::abs(e.getBandGainDb(b)));
     double lift = rmsDb(L, 48000 * 3) - rmsDb(L0, 48000 * 3);
     std::printf("    residual adaptive gain %.2f dB, level change %.2f dB\n", m, lift);
     CHECK(m < 0.5f, "gains stuck after signal dropped (%.2f dB)", m);
@@ -291,18 +315,28 @@ static void testSilenceAfterLoud() {
 
 static void testGainMatchDelta() {
     std::puts("[T11] gain match holds loudness; delta = wet - dry; mono == stereo-L");
-    { WaveSurferEngine e; e.prepare(48000); Params p = P(1, 0, 1, 1, 0, 1); p.gainMatch = true; e.setParameters(p);
-      std::vector<float> L, R; gen(Sig::Pink, 48000, 48000 * 6, L, R); auto L0 = L; run(e, L, R, 512);
-      WaveSurferEngine u; u.prepare(48000); u.setParameters(P(1, 0, 1, 1, 0, 1)); std::vector<float> L2, R2; gen(Sig::Pink, 48000, 48000 * 6, L2, R2); run(u, L2, R2, 512);
-      double dm = rmsDb(L, 48000 * 4) - rmsDb(L0, 48000 * 4), du = rmsDb(L2, 48000 * 4) - rmsDb(L0, 48000 * 4);
-      std::printf("    level change: unmatched %+.2f dB, matched %+.2f dB (gm %.2f dB)\n", du, dm, e.getGainMatchDb());
-      CHECK(std::abs(dm) < 1.0, "gain match off by %.2f dB", dm); }
+    for (int mode = 0; mode < 2; ++mode) {
+      const auto ref = mode ? Reference::Pink : Reference::Ear;
+      std::vector<float> L0, R0; gen(Sig::Pink, 48000, 48000 * 6, L0, R0);
+      for (int k = 0; k < (int) L0.size(); ++k) { L0[k] *= 0.6f; R0[k] *= 0.6f; }
+      // shape the input so there is something to correct
+      float y = 0; for (size_t k = 0; k < L0.size(); ++k) { y += 0.2f * (L0[k] - y); L0[k] = 0.5f * L0[k] + y; R0[k] = 0.5f * R0[k] + y; }
+      Params p = P(2, 1, 0.5f, 1, 20, 1); p.reference = ref;
+      WaveSurferEngine u; u.prepare(48000); u.setParameters(p);
+      p.gainMatch = true; WaveSurferEngine e; e.prepare(48000); e.setParameters(p);
+      auto L = L0, R = R0, L2 = L0, R2 = R0; run(e, L, R, 512); run(u, L2, R2, 512);
+      const int from = 48000 * 3;
+      double base = kLoudness(L0, R0, from), dm = kLoudness(L, R, from) - base, du = kLoudness(L2, R2, from) - base;
+      std::printf("    %s: K-weighted loudness change unmatched %+.2f dB, matched %+.2f dB\n", mode ? "pink" : "ear ", du, dm);
+      CHECK(std::abs(dm) < 0.75, "loudness match (%s) off by %.2f dB", mode ? "pink" : "ear", dm);
+      CHECK(std::abs(du) > std::abs(dm), "loudness match had no effect (%s)", mode ? "pink" : "ear"); }
     { WaveSurferEngine w, d; w.prepare(48000); d.prepare(48000); Params p = P(1, 1, 0, 0.5f, 0, 1); w.setParameters(p); p.delta = true; d.setParameters(p);
       std::vector<float> L, R; gen(Sig::Pink, 48000, 48000 * 2, L, R); auto dry = L; auto L2 = L, R2 = R;
       run(w, L, R, 512); run(d, L2, R2, 512); float err = 0;
       for (size_t i = 48000; i < L.size(); ++i) err = std::max(err, std::abs(L2[i] - (L[i] - dry[i])));
       CHECK(err < 1e-5f, "delta mismatch %g", err); }
-    { WaveSurferEngine s, m; s.prepare(48000); m.prepare(48000); s.setParameters(P(1, 1, 0, 0.5f, 3, 1)); m.setParameters(P(1, 1, 0, 0.5f, 3, 1));
+    { WaveSurferEngine s, m; s.prepare(48000); m.prepare(48000); Params q = P(1, 1, 0, 0.5f, 3, 1); q.gainMatch = true; q.lookahead = true;
+      s.setParameters(q); m.setParameters(q);
       std::vector<float> L, R; gen(Sig::Pink, 48000, 48000, L, R); R = L; auto M = L, dummy = L;
       run(s, L, R, 512, true); run(m, M, dummy, 512, false);
       CHECK(!std::memcmp(L.data(), M.data(), L.size() * 4), "mono path differs from stereo L=R"); }
@@ -343,14 +377,103 @@ static void testLongRun() {
     CHECK(fin, "non-finite in long run");
 }
 
+// ============================================================ v1.1 checks ====
+static int bandNear(const WaveSurferEngine& e, double f) {
+    int best = 0; for (int b = 1; b < 32; ++b) if (std::abs(std::log2(e.getBandFreq(b) / f)) < std::abs(std::log2(e.getBandFreq(best) / f))) best = b; return best;
+}
+
+static void testPink() {
+    std::puts("[T15] Pink reference: pink stays flat, bright tilt gets tamed, empty sub isn't filled");
+    { WaveSurferEngine e; e.prepare(48000); Params p = P(2, 2, 0, 0, 0, 1); p.reference = Reference::Pink; e.setParameters(p);
+      std::vector<float> L, R; gen(Sig::Pink, 48000, 48000 * 8, L, R); run(e, L, R, 512);
+      float m = 0; for (int b = 0; b < 32; ++b) m = std::max(m, std::abs(e.getBandGainDb(b)));
+      std::printf("    pink noise in Pink mode (200%%/200%%): max |band gain| %.2f dB\n", m);
+      CHECK(m < 1.5f, "pink noise not left flat in Pink mode (%.2f dB)", m); }
+    { WaveSurferEngine e; e.prepare(48000); Params p = P(0, 1, 0, 0, 0, 1); p.reference = Reference::Pink; e.setParameters(p);
+      std::vector<float> L, R; gen(Sig::Pink, 48000, 48000 * 8, L, R);
+      float x1 = 0, h = 0; for (size_t k = 0; k < L.size(); ++k) { h = 0.75f * (h + L[k] - x1); x1 = L[k]; L[k] = R[k] = L[k] + 1.5f * h; } // bright tilt
+      run(e, L, R, 512);
+      const float g8 = e.getBandGainDb(bandNear(e, 8000)), g200 = e.getBandGainDb(bandNear(e, 200));
+      std::printf("    bright-tilted noise, Tame 100%%: 8 kHz %.2f dB, 200 Hz %.2f dB\n", g8, g200);
+      CHECK(g8 < -2.0f && g8 < g200 - 2.0f, "Pink mode didn't tame the bright tilt (8k %.2f, 200 %.2f)", g8, g200); }
+    { WaveSurferEngine e; e.prepare(48000); Params p = P(2, 0, 1, 0, 0, 1); p.reference = Reference::Pink; e.setParameters(p);
+      std::vector<float> L, R; gen(Sig::Pink, 48000, 48000 * 8, L, R);
+      double s1 = 0, s2 = 0, s3 = 0, s4 = 0; const double a = std::exp(-2 * 3.14159265358979 * 120.0 / 48000);   // 4-pole HPF @120 Hz
+      for (size_t k = 0; k < L.size(); ++k) { double x = L[k]; s1 = a * (s1 + x) - a * x + (1 - a) * 0 + 0; double y1 = x - (x - s1);
+          (void) y1; s1 = a * s1 + (1 - a) * x; double h1 = x - s1; s2 = a * s2 + (1 - a) * h1; double h2 = h1 - s2;
+          s3 = a * s3 + (1 - a) * h2; double h3 = h2 - s3; s4 = a * s4 + (1 - a) * h3; double h4 = h3 - s4; L[k] = R[k] = (float) h4; }
+      run(e, L, R, 512);
+      float sub = -99; for (int b = 0; b < 32; ++b) if (e.getBandFreq(b) < 35) sub = std::max(sub, e.getBandGainDb(b));
+      std::printf("    high-passed (120 Hz) mix, Recover 200%%, Bias +100%%: max gain below 35 Hz %.2f dB\n", sub);
+      CHECK(sub < 1.0f, "Pink mode filled an empty sub region (%.2f dB)", sub); }
+}
+
+static void testBiasBrightenBoost() {
+    std::puts("[T16] Bias moves the split, Brighten/Bias alone are a null, Boost follows ISO 226");
+    auto meanGain = [](float bias) { WaveSurferEngine e; e.prepare(48000); e.setParameters(P(1, 0, bias, 0, 0, 1));
+        std::vector<float> L, R; gen(Sig::PinkPlusTone, 48000, 48000 * 3, L, R); run(e, L, R, 512);
+        float s = 0; for (int b = 0; b < 32; ++b) s += e.getBandGainDb(b); return s / 32; };
+    const float gm = meanGain(-1), gp = meanGain(1);
+    std::printf("    Recover only: mean gain Bias -100%% %.2f dB, +100%% %.2f dB\n", gm, gp);
+    CHECK(gp > gm + 0.5f, "Bias doesn't move the split with Recover alone (%.2f vs %.2f)", gm, gp);
+
+    { WaveSurferEngine e; e.prepare(48000); e.setParameters(P(0, 0, 1, 1, 0, 1));
+      std::vector<float> L, R; gen(Sig::PinkPlusTone, 48000, 48000 * 2, L, R); auto L0 = L;
+      run(e, L, R, 512); CHECK(!std::memcmp(L.data(), L0.data(), L.size() * 4), "Brighten/Bias changed audio with Recover=Tame=0"); }
+
+    { WaveSurferEngine e; e.prepare(48000);
+      const int b40 = bandNear(e, 40), b1k = bandNear(e, 1000), b3k = bandNear(e, 3150);
+      const float up40 = e.getBoostCurveDb(b40, 20), up1k = e.getBoostCurveDb(b1k, 20), up3k = e.getBoostCurveDb(b3k, 20);
+      const float dn40 = e.getBoostCurveDb(b40, -20);
+      std::printf("    Boost +20: 40 Hz %+.1f, 1 kHz %+.1f, 3.15 kHz %+.1f dB | Boost -20: 40 Hz %+.1f dB\n", up40, up1k, up3k, dn40);
+      CHECK(up40 > 2.0f && std::abs(up1k) < 0.6f && dn40 < -2.0f, "Boost curve wrong");
+      CHECK(exactly(e.getBoostCurveDb(b40, 0.0f), 0.0f), "Boost 0 not exactly flat");
+      // Boost works alone (global) and ignores the frequency limits
+      WaveSurferEngine g; g.prepare(48000); g.setParameters(P(0, 0, 0, 0, 20, 1, 1000, 2000));
+      std::vector<float> L, R; gen(Sig::Pink, 48000, 48000, L, R); run(g, L, R, 512);
+      CHECK(g.getBandGainDb(b40) > 2.0f, "Boost didn't act alone / outside limits (%.2f)", g.getBandGainDb(b40)); }
+
+    { auto bright = [](float bri) { WaveSurferEngine e; e.prepare(48000); e.setParameters(P(1, 1, 0, bri, 0, 1));
+        std::vector<float> L, R; gen(Sig::PinkPlusTone, 48000, 48000 * 3, L, R); run(e, L, R, 512); return e.getBrightnessDelta(); };
+      const float bd = bright(-1), bu = bright(1);
+      std::printf("    brightness meter: Brighten -100%% %+.3f Bark, +100%% %+.3f Bark\n", bd, bu);
+      CHECK(bu > bd + 0.05f, "Brighten doesn't move perceived brightness (%.3f vs %.3f)", bd, bu); }
+}
+
+static void testLookahead() {
+    std::puts("[T17] lookahead: reported latency, bit-exact delayed bypass and null, delta silence");
+    for (double fs : { 44100.0, 48000.0, 96000.0 }) {
+        const int N = (int) std::lround(0.02 * fs);
+        auto check = [&](Params p, const char* what, bool expectZero) {
+            WaveSurferEngine e; e.prepare(fs); p.lookahead = true; e.setParameters(p);
+            std::vector<float> L, R; gen(Sig::Pink, fs, (int) fs, L, R); auto L0 = L, R0 = R;
+            run(e, L, R, 0);
+            CHECK(e.getLatencySamples() == N, "latency %d != %d", e.getLatencySamples(), N);
+            bool ok = true;
+            for (size_t i = (size_t) N; i < L.size(); ++i) {
+                const float want = expectZero ? 0.0f : L0[i - (size_t) N];
+                if (L[i] != want || R[i] != (expectZero ? 0.0f : R0[i - (size_t) N])) { ok = false; break; }
+            }
+            CHECK(ok, "%s @%.0f not bit-exact", what, fs);
+        };
+        Params byp = P(2, 2, 1, 1, 30, 1); byp.bypass = true; check(byp, "bypass + lookahead", false);
+        check(P(2, 2, 1, 1, 30, 0), "Amount 0 + lookahead", false);
+        Params d = P(0, 0, 0, 0, 0, 1); d.delta = true; check(d, "delta at unity + lookahead", true);
+    }
+    WaveSurferEngine e; e.prepare(48000); e.setParameters(P(0, 0, 0, 0, 0, 1));
+    CHECK(e.getLatencySamples() == 0, "latency without lookahead should be 0");
+}
+
 static void benchmark() {
-    std::puts("[CPU] single core, stereo, block 512, Recover 70% / Tame 50% (all bells active)");
+    std::puts("[CPU] single core, stereo, block 512, Recover 70% / Tame 50%, Boost, loudness match, lookahead (worst case)");
     std::puts("      per-block time = fastest of 5 repeats (removes OS/VM scheduling noise)");
     for (double fs : { 44100.0, 48000.0, 96000.0, 192000.0 }) {
         const int secs = 10, bs = 512; std::vector<float> L0, R0; gen(Sig::Pink, fs, (int)fs * secs, L0, R0);
         const int nb = (int)L0.size() / bs; std::vector<double> best(nb, 1e9);
         for (int rep = 0; rep < 5; ++rep) {
-            WaveSurferEngine e; e.prepare(fs); e.setParameters(P(0.7f, 0.5f, 0, 0.3f, 1, 1));
+            WaveSurferEngine e; e.prepare(fs); Params p = P(0.7f, 0.5f, 0, 0.3f, 6, 1); p.gainMatch = true; p.lookahead = true;
+            if (fs == 48000.0 && rep % 2) p.reference = Reference::Pink;
+            e.setParameters(p);
             auto L = L0, R = R0;
             for (int k = 0; k < nb; ++k) { float* ch[2] = { L.data() + k * bs, R.data() + k * bs }; auto t0 = Clock::now(); e.process(ch, 2, bs);
                 best[k] = std::min(best[k], std::chrono::duration<double>(Clock::now() - t0).count()); }
@@ -365,6 +488,7 @@ int main() {
     std::puts("=== WaveSurfer extreme-level quality check ===");
     testClipper(); testKalman(); testIso(); testNull(); testExtremeGrid(); testNaN(); testRatesBlocks();
     testAutomation(); testBehaviour(); testSilenceAfterLoud(); testGainMatchDelta(); testEdgeCalls(); testDenormal(); testLongRun();
+    testPink(); testBiasBrightenBoost(); testLookahead();
     benchmark();
     std::printf("\n=== %d checks passed, %d failed ===\n", g_pass, g_fail);
     for (auto& f : g_failures) std::printf("  - %s\n", f.c_str());

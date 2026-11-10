@@ -34,13 +34,15 @@ private:
     Canvas canvas { *this };
 
     wsui::Display display { theme, proc };
-    std::unique_ptr<wsui::Knob> recover, tame, amount, bias, brighten, boost, lowLimit, highLimit;
-    juce::TextButton gainMatchBtn { "Gain Match" }, deltaBtn { "Delta" }, clipBtn { "Clip" }, bypassBtn { "Bypass" };
+    std::unique_ptr<wsui::Knob> recover, tame, amount, bias, brighten, boost, output, lowLimit, highLimit;
+    std::unique_ptr<wsui::Segmented> reference;
+    juce::TextButton lookaheadBtn { "Lookahead" }, gainMatchBtn { "Loudness" }, deltaBtn { "Delta" },
+                     clipBtn { "Clip" }, bypassBtn { "Bypass" };
     std::vector<std::unique_ptr<juce::AudioProcessorValueTreeState::ButtonAttachment>> buttonAttachments;
     juce::TooltipWindow tooltips { this, 600 };
 
-    float gmShown = 0.0f;
-    bool gmOnShown = false;
+    float recShown = 0.0f, tameShown = 0.0f, brightShown = 0.0f;
+    int latencyMsShown = -1;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(WaveSurferEditor)
 };

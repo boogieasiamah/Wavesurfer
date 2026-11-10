@@ -20,8 +20,9 @@ int main(int argc, char** argv)
         p->setValueNotifyingHost(p->convertTo0to1(v));
     };
     set("recover", 0.85f); set("tame", 0.78f); set("bias", 0.30f); set("brighten", 0.25f);
-    set("amount", 0.90f);  set("boost", 0.0f); set("lowLimit", 42.0f); set("highLimit", 16000.0f);
-    set("gainMatch", 1.0f);
+    set("amount", 0.90f);  set("boost", 6.0f); set("lowLimit", 42.0f); set("highLimit", 16000.0f);
+    set("gainMatch", 1.0f); set("lookahead", 1.0f);
+    if (argc > 3 && juce::String(argv[3]) == "pink") set("reference", 1.0f);
 
     // synthetic mix: kick, bass, pink bed, boxy 450 Hz + harsh 2.6 kHz resonances, hats
     juce::Random rng(7);

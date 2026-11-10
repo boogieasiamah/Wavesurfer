@@ -9,12 +9,16 @@ Brand: Quantum Research Audio. Free/research release.
 - Control rate (~1.5 kHz, N = fs/1500 samples): Kalman (dB), ISO 226 weighting, two-pass
   spreading (O(N)), gain law, bell coefficients, gain match.
 - Audio is processed in chunks aligned to control blocks, so output is bit-identical at any host block size.
-- Zero latency; dry is aligned for delta and bypass.
+- Two references: Ear (ISO 226 + Bark masking, fast) and Pink (long-term balance vs pink, slow, power-averaged).
+- Zero latency by default; optional 20 ms lookahead (delay line always runs; latency reported via AsyncUpdater).
+  Dry is taken after the delay, so delta and bypass stay aligned.
+- Loudness match is predictive: K-weighted band power x exact bell response at band centres. No feedback loop.
 
 ## Quality protocol (run before every release)
-1. `WaveSurferStressTest`: all 256 parameter corners x 6 signals, NaN/inf/1e30 injection,
+1. `WaveSurferStressTest` (73 checks): all 256 parameter corners x 6 signals x modes, NaN/inf/1e30 injection,
    22.05k–384k x block sizes 1–8192, automation torture, nulls, denormals, 60 s long run, CPU.
-2. `WaveSurferHostTest` on the built VST3: random extreme automation, state round trip, mono, editor lifecycle.
+2. `WaveSurferHostTest` on the built VST3: random extreme automation, state round trip, mono, editor lifecycle,
+   lookahead latency reported to the host.
 3. `WaveSurferSnapshot --editor-stress`: real windows opened/closed under audio + automation load.
 4. Sanitizer build of the stress test: `g++ -std=c++17 -O1 -g -fsanitize=address,undefined -ISource Tests/StressTest.cpp`.
 5. Zero warnings under `juce_recommended_warning_flags`.
@@ -42,3 +46,10 @@ Brand: Quantum Research Audio. Free/research release.
     may "relocate" a plugin into some other copy on the user's disk.
 16. In packaging scripts, make output paths absolute before any `cd`. A relative zip path silently went to a temp dir.
 17. Let CI publish releases (GITHUB_TOKEN inside Actions); keep the version in CMakeLists.txt as the single source.
+18. Never average noisy band levels in dB: E[log] < log E, so low bands (few cycles per window) read 3-5 dB low.
+    Smooth in power first, then convert. Calibrate each band's pink-noise reading analytically.
+19. "x + 1*(dry - x)" is not exactly dry in float. Select the dry/wet endpoint directly when a crossfade sits at 0 or 1.
+20. Predicting loudness from the *target* curve overshot by 1.3-1.7 dB. Use the filters' exact response at the band centres.
+21. A linear tilt cancels out of any "band vs neighbours" measure. To make a tilt control audible, tilt the decision
+    thresholds per frequency as well as the input.
+22. Name the new behaviour, not the old knob: when a parameter changes meaning (Boost), add a new one (Output) for the old job.

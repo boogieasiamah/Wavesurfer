@@ -23,7 +23,8 @@ WaveSurferEditor::WaveSurferEditor(WaveSurferProcessor& p)
     amount    = make("amount",    "Amount",    Knob::Size::Big,    false, "Scales the whole correction curve. 0% is a bit-exact bypass.");
     bias      = make("bias",      "Bias",      Knob::Size::Medium, true,  "Left favours Tame, right favours Recover.");
     brighten  = make("brighten",  "Brighten",  Knob::Size::Medium, true,  "Perceptual tilt: darker to the left, brighter to the right.");
-    boost     = make("boost",     "Boost",     Knob::Size::Small,  true,  "Output gain, after gain match.");
+    boost     = make("boost",     "Boost",     Knob::Size::Small,  true,  "Listening level: shifts the balance the way the ear hears louder (+) or quieter (-) playback. Global.");
+    output    = make("output",    "Output",    Knob::Size::Small,  true,  "Output gain, after loudness match.");
     lowLimit  = make("lowLimit",  "Low",       Knob::Size::Small,  false, "Lowest frequency WaveSurfer may touch (or drag the red handle).");
     highLimit = make("highLimit", "High",      Knob::Size::Small,  false, "Highest frequency WaveSurfer may touch (or drag the red handle).");
 
@@ -34,7 +35,13 @@ WaveSurferEditor::WaveSurferEditor(WaveSurferProcessor& p)
         canvas.addAndMakeVisible(b);
         buttonAttachments.push_back(std::make_unique<AudioProcessorValueTreeState::ButtonAttachment>(s, id, b));
     };
-    pill(gainMatchBtn, "gainMatch", false, "Keeps output loudness equal to input, for honest A/B.");
+    pill(lookaheadBtn, "lookahead", false, "20 ms lookahead: smoother on transients, adds 20 ms latency (reported to the host).");
+    pill(gainMatchBtn, "gainMatch", false, "Keeps perceived (K-weighted) loudness equal to the input, for honest A/B.");
+    if (auto* refParam = s.getParameter("reference")) {
+        reference = std::make_unique<wsui::Segmented>(theme, *refParam, StringArray { "Ear  ISO 226", "Pink Noise" });
+        reference->setTooltip("Ear: unmask by how we hear (ISO 226 + masking). Pink: pull the long-term balance toward pink noise.");
+        canvas.addAndMakeVisible(*reference);
+    }
     pill(deltaBtn,     "delta",     false, "Listen only to what WaveSurfer changes.");
     pill(clipBtn,      "clip",      false, "Transparent safety clipper on the output (unity below -0.9 dBFS).");
     pill(bypassBtn,    "bypass",    true,  "Click-free bypass.");
@@ -59,13 +66,14 @@ void WaveSurferEditor::resized()
     canvas.setBounds(0, 0, baseW, baseH);
     canvas.setTransform(AffineTransform::scale(scale));
 
-    // header pills (right aligned)
+    // header: reference switch + pills (right aligned)
+    if (reference) reference->setBounds(338, 22, 228, 30);
     int x = baseW - 28;
-    for (auto* b : { &bypassBtn, &clipBtn, &deltaBtn, &gainMatchBtn }) {
-        const int w = b == &gainMatchBtn ? 112 : 84;
+    for (auto* b : { &bypassBtn, &clipBtn, &deltaBtn, &gainMatchBtn, &lookaheadBtn }) {
+        const int w = b == &bypassBtn ? 78 : b == &clipBtn ? 62 : b == &deltaBtn ? 70 : b == &gainMatchBtn ? 96 : 106;
         x -= w;
         b->setBounds(x, 22, w, 30);
-        x -= b == &bypassBtn ? 18 : 8;
+        x -= b == &bypassBtn ? 16 : 8;
     }
 
     display.setBounds(24, 72, baseW - 48, 320);
@@ -81,17 +89,23 @@ void WaveSurferEditor::resized()
     place(*bias,      668, deckY + 30, 120, 150);
     place(*brighten,  798, deckY + 30, 120, 150);
     place(*boost,     960, deckY + 20,  90, 100);
+    place(*output,    960, deckY + 124, 90, 100);
 }
 
 void WaveSurferEditor::refresh()
 {
     display.update();
-    const float gm = proc.getEngine().getSnapshot().gainMatchDb.load(std::memory_order_relaxed);
-    const bool on = *proc.apvts.getRawParameterValue("gainMatch") > 0.5f;
-    if (std::abs(gm - gmShown) > 0.05f || on != gmOnShown) {
-        gmShown = gm; gmOnShown = on;
-        canvas.repaint(910, 540, 110, 80);
+    const auto& snap = proc.getEngine().getSnapshot();
+    const float rec = snap.recoverDb.load(std::memory_order_relaxed);
+    const float tam = snap.tameDb.load(std::memory_order_relaxed);
+    const float bri = snap.brightDelta.load(std::memory_order_relaxed);
+    if (std::abs(rec - recShown) > 0.02f || std::abs(tam - tameShown) > 0.02f) {
+        recShown = rec; tameShown = tam; canvas.repaint(200, 592, 260, 34);
     }
+    if (std::abs(bri - brightShown) > 0.004f) { brightShown = bri; canvas.repaint(600, 592, 260, 34); }
+    const float fsNow = snap.sampleRate.load(std::memory_order_relaxed);
+    const int ms = roundToInt(1000.0f * (float) snap.latency.load(std::memory_order_relaxed) / jmax(1.0f, fsNow));
+    if (ms != latencyMsShown) { latencyMsShown = ms; canvas.repaint(baseW - 460, baseH - 26, 440, 20); }
 }
 
 void WaveSurferEditor::Canvas::paint(Graphics& g)
@@ -139,23 +153,17 @@ void WaveSurferEditor::Canvas::paint(Graphics& g)
     g.drawText("BALANCE", Rectangle<float>(668, deck.getY() + 14, 130, 12), Justification::centred);
     g.drawText("OUTPUT",  Rectangle<float>(900, deck.getY() + 10, 120, 12), Justification::centred);
 
-    // gain match readout under Boost
-    const auto gm = Rectangle<float>(915, 548, 90, 64);
-    g.setFont(th.caps(9.0f));
-    g.setColour(Pal::dim);
-    g.drawText("MATCH", gm.withHeight(14), Justification::centred);
-    g.setFont(th.value(14.0f));
-    g.setColour(ed.gmOnShown ? Pal::teal : Pal::faint);
-    const String gmText = ed.gmOnShown ? String(ed.gmShown >= 0 ? "+" : "") + String(ed.gmShown, 1) + " dB" : String("OFF");
-    g.drawText(gmText, gm.withTrimmedTop(16).withHeight(20), Justification::centred);
-    g.setFont(th.font(th.regular, 9.0f));
-    g.setColour(Pal::faint);
-    g.drawText("auto loudness", gm.withTrimmedTop(38).withHeight(12), Justification::centred);
+    // activity meters (Gullfoss-style): Recover vs Tame, perceived brightness shift
+    wsui::drawCentreMeter(g, th, { 212, 598, 232, 22 }, "TAME", "RECOVER",
+                          -ed.tameShown / 6.0f, ed.recShown / 6.0f, Pal::coral, Pal::teal);
+    wsui::drawCentreMeter(g, th, { 618, 598, 232, 22 }, "DARKER", "BRIGHTER",
+                          -ed.brightShown / 1.2f, ed.brightShown / 1.2f, Pal::blue.brighter(0.4f), Pal::amber);
 
     // footer
     g.setFont(th.caps(8.5f));
     g.setColour(Pal::faint);
     g.drawText("QUANTUM RESEARCH AUDIO", Rectangle<float>(30, (float) baseH - 22, 300, 14), Justification::centredLeft);
-    g.drawText(String(CharPointer_UTF8("WAVESURFER 1.0  \xc2\xb7  ZERO LATENCY  \xc2\xb7  LINKED STEREO")),
+    const String lat = ed.latencyMsShown > 0 ? "LATENCY " + String(ed.latencyMsShown) + " MS" : String("ZERO LATENCY");
+    g.drawText(String(CharPointer_UTF8("WAVESURFER 1.1  \xc2\xb7  ")) + lat + String(CharPointer_UTF8("  \xc2\xb7  LINKED STEREO")),
                Rectangle<float>((float) baseW - 430, (float) baseH - 22, 400, 14), Justification::centredRight);
 }

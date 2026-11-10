@@ -2,7 +2,8 @@
 
 A Gullfoss-style unmasking EQ by Quantum Research Audio. It listens to the mix
 through a perceptual model, cuts the frequencies that dominate (Tame) and lifts
-the ones that are being masked (Recover). Zero latency, about 0.6% of one CPU core.
+the ones that are being masked (Recover), or pulls the mix toward a pink-noise balance.
+Zero latency (or 20 ms with Lookahead), about 0.6% of one CPU core.
 
 ![WaveSurfer UI](wavesurfer_ui.png)
 
@@ -10,20 +11,25 @@ the ones that are being masked (Recover). Zero latency, about 0.6% of one CPU co
 
 | Control | Range | What it does |
 |---|---|---|
-| Recover | 0–100% | Lifts bands masked by their neighbours |
-| Tame | 0–100% | Cuts dominant / resonant bands |
-| Bias | −100…+100% | Left favours Tame, right favours Recover |
-| Brighten | −100…+100% | Perceptual tilt: darker ↔ brighter |
+| Reference | Ear / Pink | **Ear (ISO 226):** unmask by how we hear (equal-loudness + masking). **Pink Noise:** pull the long-term balance toward pink noise |
+| Recover | 0–200% | Lifts masked bands (Ear) or bands below the pink line (Pink). 30–50% is the gentle zone |
+| Tame | 0–200% | Cuts dominant/resonant bands (Ear) or bands above the pink line (Pink) |
+| Bias | −100…+100% | Moves the split between Recover and Tame. + gives Recover more of the spectrum |
+| Brighten | −100…+100% | Prefers darker or brighter outcomes. Needs Recover or Tame (does nothing alone) |
+| Boost | ±50 dB | Listening level on the ISO 226 contours: + sounds like louder playback (more lows/highs), − like quieter. Global |
 | Amount | 0–100% | Scales the whole curve. 0% = bit-exact pass-through |
-| Boost | ±12 dB | Output gain (after gain match) |
-| Low / High | 20 Hz–2 kHz / 1–20 kHz | Processing limits. Also draggable red handles in the display |
-| Gain Match | on/off | Holds output loudness equal to input, for honest A/B |
+| Output | ±12 dB | Output gain, after loudness match |
+| Low / High | 20 Hz–2 kHz / 1–20 kHz | Recover/Tame limits. Also draggable red handles in the display |
+| Lookahead | on/off | 20 ms lookahead for smoother transients (latency reported to the DAW) |
+| Loudness | on (default) | Keeps perceived (K-weighted) loudness equal to the input, for honest A/B |
 | Delta | on/off | Hear only what WaveSurfer changes |
 | Clip | on/off | Transparent safety clipper (unity below −0.9 dBFS) |
-| Bypass | on/off | Click-free, host-linked bypass |
+| Bypass | on/off | Click-free, host-linked, bit-exact bypass |
+
+Meters: Tame ↔ Recover activity and Darker ↔ Brighter (perceived brightness shift, in Bark) under the knobs.
 
 Parameter IDs from the original SpectralUnmasker are unchanged, so old sessions load.
-Brighten is now bipolar (default 0).
+In v1.1 Boost became a listening-level control; the old output gain is now **Output**.
 
 ## Install (macOS)
 
