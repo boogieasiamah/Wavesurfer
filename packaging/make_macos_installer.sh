@@ -4,6 +4,7 @@
 set -euo pipefail
 ART="$1"; VER="$2"; OUT="$3"
 mkdir -p "$OUT"
+OUT="$(cd "$OUT" && pwd)"   # absolute: the zip step runs from another directory
 STAGE="$(mktemp -d)"
 
 mkdir -p "$STAGE/root/Library/Audio/Plug-Ins/VST3" \
