@@ -1,0 +1,111 @@
+name: Build WaveSurfer
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  JUCE_COMMIT: d60b7a78030661574a615b586d9325ba7a7fa7dd   # JUCE 9.0, the version WaveSurfer was tested on
+
+jobs:
+  macos:
+    name: macOS (VST3 + AU + Standalone, universal, 10.13+)
+    runs-on: macos-15
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch JUCE (pinned)
+        run: |
+          git init -q JUCE
+          git -C JUCE remote add origin https://github.com/juce-framework/JUCE.git
+          git -C JUCE fetch -q --depth 1 origin "$JUCE_COMMIT"
+          git -C JUCE checkout -q FETCH_HEAD
+
+      - name: Toolchain
+        run: |
+          xcodebuild -version
+          cmake --version
+
+      - name: QC 1 — DSP stress test (all parameters at extremes)
+        run: |
+          clang++ -std=c++17 -O2 -ISource Tests/StressTest.cpp -o stress
+          ./stress
+
+      - name: Configure
+        run: >
+          cmake -B build
+          -DCMAKE_BUILD_TYPE=Release
+          -DCMAKE_OSX_ARCHITECTURES="arm64;x86_64"
+          -DCMAKE_OSX_DEPLOYMENT_TARGET=10.13
+          -DWAVESURFER_HOST_TEST=ON
+
+      - name: Build
+        run: cmake --build build --config Release -j 4 --target WaveSurfer_VST3 WaveSurfer_AU WaveSurfer_Standalone WaveSurferHostTest
+
+      - name: Ad-hoc sign
+        run: |
+          ART=build/WaveSurfer_artefacts/Release
+          for b in "$ART/VST3/WaveSurfer.vst3" "$ART/AU/WaveSurfer.component" "$ART/Standalone/WaveSurfer.app"; do
+            codesign --force --deep --sign - "$b"
+            codesign --verify --deep --strict "$b"
+          done
+
+      - name: QC 2 — architectures and minimum macOS
+        run: |
+          ART=build/WaveSurfer_artefacts/Release
+          BIN="$ART/VST3/WaveSurfer.vst3/Contents/MacOS/WaveSurfer"
+          lipo -info "$BIN"
+          lipo -info "$BIN" | grep -q x86_64
+          lipo -info "$BIN" | grep -q arm64
+          vtool -arch x86_64 -show-build "$BIN" | tee /tmp/vtool.txt
+          grep -Eq "(minos|version) 10\.13" /tmp/vtool.txt
+
+      - name: QC 3 — load VST3 like a DAW (automation, state, mono, editor)
+        run: |
+          HOST=$(find build/WaveSurferHostTest_artefacts -type f -name WaveSurferHostTest -perm -u+x | head -1)
+          "$HOST" build/WaveSurfer_artefacts/Release/VST3/WaveSurfer.vst3
+
+      - name: QC 4 — Apple auval (strict)
+        run: |
+          mkdir -p ~/Library/Audio/Plug-Ins/Components
+          cp -R build/WaveSurfer_artefacts/Release/AU/WaveSurfer.component ~/Library/Audio/Plug-Ins/Components/
+          killall -9 AudioComponentRegistrar 2>/dev/null || true
+          sleep 3
+          auval -a | grep -i "Qrau" || true
+          auval -strict -v aufx Wsrf Qrau
+
+      - name: Package installer + zip
+        run: |
+          VER=$(grep -Eo 'project\(WAVESURFER VERSION [0-9.]+' CMakeLists.txt | awk '{print $3}')
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then VER="${GITHUB_REF_NAME#v}"; fi
+          echo "VER=$VER" >> "$GITHUB_ENV"
+          bash packaging/make_macos_installer.sh build/WaveSurfer_artefacts/Release "$VER" dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: WaveSurfer-${{ env.VER }}-macOS
+          path: dist/*
+          if-no-files-found: error
+
+      - name: Publish GitHub Release (tags only)
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          cat > notes.md <<EOF
+          macOS universal (Intel + Apple Silicon), macOS 10.13+. VST3, AU and Standalone.
+
+          **Install:** open \`WaveSurfer-$VER-macOS.pkg\`. If macOS warns, right-click it and choose Open
+          (the build is ad-hoc signed, not notarised).
+
+          Passed in CI: DSP stress test (every parameter at its extremes), VST3 host test, \`auval -strict\`.
+          EOF
+          gh release create "$GITHUB_REF_NAME" dist/* --title "WaveSurfer $VER" --notes-file notes.md \
+            || gh release upload "$GITHUB_REF_NAME" dist/* --clobber
