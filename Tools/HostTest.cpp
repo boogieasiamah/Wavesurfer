@@ -3,6 +3,12 @@
 #include <juce_audio_processors/juce_audio_processors.h>
 #include <juce_gui_extra/juce_gui_extra.h>
 
+#if JUCE_MAJOR_VERSION >= 9
+ #define WS_CREATE_EDITOR(p) (p)->createEditorAndMakeActive()
+#else
+ #define WS_CREATE_EDITOR(p) (p)->createEditorIfNeeded()
+#endif
+
 static int passes = 0, fails = 0;
 #define EXPECT(c, msg) do { if (c) ++passes; else { ++fails; std::printf("  FAIL: %s\n", msg); } } while (0)
 
@@ -19,7 +25,11 @@ int main(int argc, char** argv)
     if (argc < 2) { std::puts("usage: WaveSurferHostTest WaveSurfer.vst3"); return 2; }
 
     juce::AudioPluginFormatManager fm;
+   #if JUCE_MAJOR_VERSION >= 9
     fm.addFormat(std::make_unique<juce::VST3PluginFormat>());
+   #else
+    fm.addFormat(new juce::VST3PluginFormat());
+   #endif
     juce::OwnedArray<juce::PluginDescription> found;
     juce::KnownPluginList list;
     list.scanAndAddFile(argv[1], true, found, *fm.getFormat(0));
@@ -118,7 +128,7 @@ int main(int argc, char** argv)
     });
     bool editorsOk = true;
     for (int k = 0; k < 5; ++k) {
-        std::unique_ptr<juce::AudioProcessorEditor> ed(plugin->createEditorAndMakeActive());
+        std::unique_ptr<juce::AudioProcessorEditor> ed(WS_CREATE_EDITOR(plugin));
         if (! ed) { editorsOk = false; break; }
         std::printf("  editor %d: %dx%d\n", k, ed->getWidth(), ed->getHeight());
         for (int t = 0; t < 20; ++t) {
@@ -159,7 +169,7 @@ int main(int argc, char** argv)
         plugin->prepareToPlay(48000, 512);
         bool ok = true;
         for (int k = 0; k < 3 && ok; ++k) {
-            std::unique_ptr<juce::AudioProcessorEditor> ed(plugin->createEditorAndMakeActive());
+            std::unique_ptr<juce::AudioProcessorEditor> ed(WS_CREATE_EDITOR(plugin));
             if (! ed) { ok = false; break; }
             ed->addToDesktop(juce::ComponentPeer::windowHasTitleBar | juce::ComponentPeer::windowIsResizable);
             ed->setVisible(true);

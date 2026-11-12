@@ -164,6 +164,9 @@ void WaveSurferEditor::Canvas::paint(Graphics& g)
     g.setColour(Pal::faint);
     g.drawText("QUANTUM RESEARCH AUDIO", Rectangle<float>(30, (float) baseH - 22, 300, 14), Justification::centredLeft);
     const String lat = ed.latencyMsShown > 0 ? "LATENCY " + String(ed.latencyMsShown) + " MS" : String("ZERO LATENCY");
-    g.drawText(String(CharPointer_UTF8("WAVESURFER 1.1  \xc2\xb7  ")) + lat + String(CharPointer_UTF8("  \xc2\xb7  LINKED STEREO")),
+   #ifndef WAVESURFER_VERSION
+    #define WAVESURFER_VERSION "dev"
+   #endif
+    g.drawText("WAVESURFER " + String(WAVESURFER_VERSION) + String(CharPointer_UTF8("  \xc2\xb7  ")) + lat + String(CharPointer_UTF8("  \xc2\xb7  LINKED STEREO")),
                Rectangle<float>((float) baseW - 430, (float) baseH - 22, 400, 14), Justification::centredRight);
 }

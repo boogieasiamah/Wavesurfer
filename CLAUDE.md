@@ -1,6 +1,8 @@
 # WaveSurfer — project guide
 
-Perceptual spectral unmasking EQ (Gullfoss-style). JUCE 9, C++17, CMake.
+Perceptual spectral unmasking EQ (Gullfoss-style). JUCE 8.0.10 (same as Flux 512), C++17, CMake.
+Targets: macOS 10.13+ universal (VST3/AU/Standalone) and Windows x64 (VST3/Standalone). The QRA rules in the
+Flux 512 repo's CLAUDE.md apply here too.
 Brand: Quantum Research Audio. Free/research release.
 
 ## Architecture (keep it this way)
@@ -23,6 +25,7 @@ Brand: Quantum Research Audio. Free/research release.
 4. Sanitizer build of the stress test: `g++ -std=c++17 -O1 -g -fsanitize=address,undefined -ISource Tests/StressTest.cpp`.
 5. Zero warnings under `juce_recommended_warning_flags`.
 6. CI also runs REAPER 7.83 on macOS 15: loads VST3 + AU, extreme parameters, opens windows, renders.
+8. `WaveSurferPluginStress`: the QRA generic extreme-parameter test from Flux 512 (548 cases), on macOS and Windows.
 7. GitHub has no macOS 10.13 runner: check imports against the 10.13 SDK exports, and test on the real High Sierra Mac.
 
 ## Lessons learned (apply to future plugins)
@@ -58,3 +61,8 @@ Brand: Quantum Research Audio. Free/research release.
 23. "Passes on macOS 15" says nothing about High Sierra. Check the x86_64 slice's imports against the 10.13 SDK .tbd
     exports, keep it free of AVX/SSE4.2 (Apple's default x86_64 CPU is Penryn: SSE4.1), and test on the real machine.
 24. REAPER on a fresh CI machine stops at "You have not selected an audio device" - click No via osascript.
+25. Use the JUCE release that is proven on the oldest target machine (8.0.10, as Flux 512), not JUCE master.
+    WaveSurfer 1.0/1.1 on JUCE 9 master passed every CI check but crashed in REAPER on the user's macOS 10.13 Mac.
+26. JUCE 8 vs 9 API: AudioPluginFormatManager::addFormat takes a raw pointer in 8; createEditorAndMakeActive is 9-only
+    (use createEditorIfNeeded). JUCE 8's juceaide needs X11 extension headers on Linux even with JUCE_USE_X*=0:
+    use stub headers via CPATH.

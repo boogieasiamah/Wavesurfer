@@ -3,42 +3,30 @@ name: Build WaveSurfer
 on:
   push:
     branches: [main]
-    tags: ['v*']
   pull_request:
   workflow_dispatch:
 
-permissions:
-  contents: write
-
-env:
-  JUCE_COMMIT: d60b7a78030661574a615b586d9325ba7a7fa7dd   # JUCE 9.0, the version WaveSurfer was tested on
+# Same layout as Flux 512: JUCE 8.0.10 (FetchContent), macOS 10.13+ universal, Windows x64,
+# one release job that publishes both. The version in CMakeLists.txt names the release.
 
 jobs:
   macos:
     name: macOS (VST3 + AU + Standalone, universal, 10.13+)
     runs-on: macos-15
-    timeout-minutes: 60
+    timeout-minutes: 75
     steps:
       - uses: actions/checkout@v5
 
-      - name: Fetch JUCE (pinned)
-        run: |
-          git init -q JUCE
-          git -C JUCE remote add origin https://github.com/juce-framework/JUCE.git
-          git -C JUCE fetch -q --depth 1 origin "$JUCE_COMMIT"
-          git -C JUCE checkout -q FETCH_HEAD
-
-      - name: Toolchain
-        run: |
-          xcodebuild -version
-          cmake --version
+      - name: Version
+        id: ver
+        run: echo "version=$(grep -Eo 'project\(WAVESURFER VERSION [0-9.]+' CMakeLists.txt | awk '{print $3}')" >> "$GITHUB_OUTPUT"
 
       - name: QC 1 — DSP stress test (all parameters at extremes)
         run: |
           clang++ -std=c++17 -O2 -ISource Tests/StressTest.cpp -o stress
           ./stress
 
-      - name: Configure
+      - name: Configure (JUCE 8.0.10)
         run: >
           cmake -B build
           -DCMAKE_BUILD_TYPE=Release
@@ -48,7 +36,7 @@ jobs:
           -DWAVESURFER_SNAPSHOT_TOOL=ON
 
       - name: Build
-        run: cmake --build build --config Release -j 4 --target WaveSurfer_VST3 WaveSurfer_AU WaveSurfer_Standalone WaveSurferHostTest WaveSurferSnapshot
+        run: cmake --build build --config Release -j 4 --target WaveSurfer_VST3 WaveSurfer_AU WaveSurfer_Standalone WaveSurferHostTest WaveSurferSnapshot WaveSurferPluginStress
 
       - name: Ad-hoc sign
         run: |
@@ -58,7 +46,7 @@ jobs:
             codesign --verify --deep --strict "$b"
           done
 
-      - name: QC 2 — architectures and minimum macOS
+      - name: QC 2 — architectures, minimum macOS, imports vs the macOS 10.13 SDK
         run: |
           ART=build/WaveSurfer_artefacts/Release
           BIN="$ART/VST3/WaveSurfer.vst3/Contents/MacOS/WaveSurfer"
@@ -67,39 +55,38 @@ jobs:
           lipo -info "$BIN" | grep -q arm64
           vtool -arch x86_64 -show-build "$BIN" | tee /tmp/vtool.txt
           grep -Eq "(minos|version) 10\.13" /tmp/vtool.txt
+          curl -fsSL -o sdk.tar.xz https://github.com/phracker/MacOSX-SDKs/releases/download/11.3/MacOSX10.13.sdk.tar.xz
+          mkdir sdk && tar -xJf sdk.tar.xz -C sdk
+          python3 Tests/check_macos_imports.py "$BIN" sdk/MacOSX10.13.sdk x86_64
+          python3 Tests/check_macos_imports.py "$ART/AU/WaveSurfer.component/Contents/MacOS/WaveSurfer" sdk/MacOSX10.13.sdk x86_64
 
-      - name: QC 3 — load VST3 like a DAW (automation, state, mono, editor)
+      - name: QC 3 — QRA generic extreme-parameter test (shared with Flux 512)
+        run: |
+          T=$(find build/WaveSurferPluginStress_artefacts -type f -name WaveSurferPluginStress -perm -u+x | head -1)
+          "$T"
+
+      - name: QC 4 — load VST3 like a DAW (automation, state, mono, latency, real window)
         run: |
           HOST=$(find build/WaveSurferHostTest_artefacts -type f -name WaveSurferHostTest -perm -u+x | head -1)
           "$HOST" build/WaveSurfer_artefacts/Release/VST3/WaveSurfer.vst3
 
-      - name: QC 3b — real editor windows under load + macOS screenshot
+      - name: QC 5 — real editor windows under load + screenshots
         run: |
           SNAP=$(find build/WaveSurferSnapshot_artefacts -type f -name WaveSurferSnapshot -perm -u+x | head -1)
           "$SNAP" --editor-stress
           "$SNAP" ui-macos.png 2
           "$SNAP" ui-macos-pink.png 2 pink
 
-      - uses: actions/upload-artifact@v4
-        with:
-          name: ui-screenshots-macos
-          path: ui-macos*.png
-
-      - name: QC 4 — Apple auval (strict)
+      - name: QC 6 — Apple auval (strict)
         run: |
           mkdir -p ~/Library/Audio/Plug-Ins/Components
           cp -R build/WaveSurfer_artefacts/Release/AU/WaveSurfer.component ~/Library/Audio/Plug-Ins/Components/
           killall -9 AudioComponentRegistrar 2>/dev/null || true
           sleep 3
-          auval -a | grep -i "Qrau" || true
           auval -strict -v aufx Wsrf Qrau
 
       - name: Package installer + zip
-        run: |
-          VER=$(grep -Eo 'project\(WAVESURFER VERSION [0-9.]+' CMakeLists.txt | awk '{print $3}')
-          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then VER="${GITHUB_REF_NAME#v}"; fi
-          echo "VER=$VER" >> "$GITHUB_ENV"
-          bash packaging/make_macos_installer.sh build/WaveSurfer_artefacts/Release "$VER" dist
+        run: bash packaging/make_macos_installer.sh build/WaveSurfer_artefacts/Release "${{ steps.ver.outputs.version }}" dist
 
       - uses: actions/upload-artifact@v4
         with:
@@ -107,35 +94,123 @@ jobs:
           path: dist/*
           if-no-files-found: error
 
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ui-screenshots-macos
+          path: ui-macos*.png
+          if-no-files-found: ignore
+
       - name: Crash reports (if any)
         if: always()
         run: |
-          ls -la ~/Library/Logs/DiagnosticReports/ 2>/dev/null | tail -20 || true
           for f in ~/Library/Logs/DiagnosticReports/*WaveSurfer* ~/Library/Logs/DiagnosticReports/*Snapshot*; do
             [ -f "$f" ] && { echo "=== $f"; head -150 "$f"; }
           done || true
 
-      - name: Publish GitHub Release
-        if: github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+  windows:
+    name: Windows (VST3 + Standalone, x64)
+    runs-on: windows-2022
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Version
+        id: ver
+        shell: bash
+        run: echo "version=$(grep -Eo 'project\(WAVESURFER VERSION [0-9.]+' CMakeLists.txt | awk '{print $3}')" >> "$GITHUB_OUTPUT"
+
+      - name: Configure (JUCE 8.0.10, static runtime)
+        run: cmake -B build -G "Visual Studio 17 2022" -A x64 -DWAVESURFER_HOST_TEST=ON -DWAVESURFER_SNAPSHOT_TOOL=ON
+
+      - name: Build
+        run: cmake --build build --config Release --parallel --target WaveSurfer_VST3 WaveSurfer_Standalone WaveSurferStressTest WaveSurferPluginStress WaveSurferHostTest WaveSurferSnapshot
+
+      - name: QC 1 — DSP stress test (all parameters at extremes)
+        run: build\Release\WaveSurferStressTest.exe
+
+      - name: QC 3 — QRA generic extreme-parameter test (shared with Flux 512)
+        run: build\WaveSurferPluginStress_artefacts\Release\WaveSurferPluginStress.exe
+
+      - name: QC 4 — load VST3 like a DAW (automation, state, mono, latency)
+        run: build\WaveSurferHostTest_artefacts\Release\WaveSurferHostTest.exe build\WaveSurfer_artefacts\Release\VST3\WaveSurfer.vst3
+
+      - name: QC 5 — real editor windows under load + screenshot
         run: |
-          TAG="v$VER"
-          cat > notes.md <<EOF
-          macOS universal (Intel + Apple Silicon), macOS 10.13+. VST3, AU and Standalone.
+          build\WaveSurferSnapshot_artefacts\Release\WaveSurferSnapshot.exe --editor-stress
+          build\WaveSurferSnapshot_artefacts\Release\WaveSurferSnapshot.exe ui-windows.png 2
 
-          **Install:** open \`WaveSurfer-$VER-macOS.pkg\`. If macOS warns, right-click it and choose Open
-          (the build is ad-hoc signed, not notarised).
+      - name: Installer + zip
+        shell: pwsh
+        run: |
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) { choco install innosetup -y --no-progress; }
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          & $iscc /DAppVersion=${{ steps.ver.outputs.version }} `
+                  /DSourceDir="$env:GITHUB_WORKSPACE\build\WaveSurfer_artefacts\Release\VST3" `
+                  /DOutDir="$env:GITHUB_WORKSPACE\dist" packaging\windows\WaveSurfer.iss
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Compress-Archive -Path "build\WaveSurfer_artefacts\Release\VST3\WaveSurfer.vst3", "build\WaveSurfer_artefacts\Release\Standalone\WaveSurfer.exe" `
+                           -DestinationPath "dist\WaveSurfer-${{ steps.ver.outputs.version }}-Windows.zip"
 
-          Passed in CI on this exact build: DSP stress test (every parameter at its extremes),
-          VST3 host test, \`auval -strict\`. Commit: ${GITHUB_SHA::7}.
-          EOF
-          if gh release view "$TAG" >/dev/null 2>&1; then
-            gh release upload "$TAG" dist/* --clobber
-            gh release edit "$TAG" --notes-file notes.md
-          else
-            gh release create "$TAG" dist/* --target "$GITHUB_SHA" --title "WaveSurfer $VER" --notes-file notes.md
-          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: WaveSurfer-Windows
+          path: dist/*
+          if-no-files-found: error
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ui-screenshot-windows
+          path: ui-windows.png
+          if-no-files-found: ignore
+
+  release:
+    name: GitHub Release
+    # Every push to main publishes (or refreshes) the release for the version in CMakeLists.txt.
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: [macos, windows]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Version
+        id: ver
+        run: echo "version=$(grep -Eo 'project\(WAVESURFER VERSION [0-9.]+' CMakeLists.txt | awk '{print $3}')" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: WaveSurfer-*
+          path: dist
+          merge-multiple: true
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ steps.ver.outputs.version }}
+          target_commitish: ${{ github.sha }}
+          name: WaveSurfer v${{ steps.ver.outputs.version }}
+          make_latest: true
+          overwrite_files: true
+          files: dist/*
+          body: |
+            **WaveSurfer** — QRA perceptual spectral unmasker. Free, for research and education.
+
+            | File | What it is |
+            |---|---|
+            | `WaveSurfer-*-macOS.pkg` | macOS installer: VST3 + AU + Standalone, Intel (macOS 10.13+) and Apple Silicon (11+) |
+            | `WaveSurfer-*-Windows.exe` | Windows installer: VST3, 64-bit |
+            | `*-macOS.zip`, `*-Windows.zip` | The plugins without an installer (Windows zip also has the standalone app) |
+
+            Built on JUCE 8.0.10 (same as Flux 512). Passed in CI on this exact build, macOS and Windows:
+            DSP stress test, QRA generic extreme-parameter test, VST3 host test, editor windows under load;
+            macOS also `auval -strict`, a REAPER load/render test, and an import check against the macOS 10.13 SDK.
+
+            The installers are not code-signed yet.
+            - macOS: right-click the .pkg → Open → Open.
+            - Windows: SmartScreen may warn → More info → Run anyway.
 
   reaper:
     name: REAPER smoke test (load VST3 + AU, open windows, render)

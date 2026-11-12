@@ -1,6 +1,13 @@
 # WaveSurfer — progress
 
-## Open issue (2026-11-11): crash in REAPER on macOS 10.13 (VST3 and AU)
+## v1.1.1 (2026-11-11): rebuilt on the Flux 512 setup — macOS 10.13+ and Windows
+- JUCE 9 master -> **JUCE 8.0.10** (FetchContent), the release Flux 512 runs on the same High Sierra Mac.
+- New Windows build: VST3 + Standalone x64, static MSVC runtime, Inno Setup installer.
+- Added the QRA generic extreme-parameter test from Flux 512 (548/548 pass locally; heaviest case 4% of real time).
+- CI now also checks every required import of the Intel binary against the macOS 10.13 SDK.
+- Local (Linux, JUCE 8): DSP 73/73, QRA stress 548/548, host 14/14, zero warnings. Awaiting test on the 10.13 Mac.
+
+## Issue (2026-11-11): v1.0/v1.1 crashed in REAPER on macOS 10.13 (VST3 and AU)
 - Not reproducible on macOS 15: REAPER 7.83 loads both formats, opens windows, renders, no crash (CI job `reaper`).
 - Ruled out: missing system symbols (all 590 imports exist in the 10.13 SDK), AVX/SSE4.2 code (SSE4.1 only),
   Metal path (off by default), HarfBuzz/CoreText version branches (compile-time, classic path on 10.13).

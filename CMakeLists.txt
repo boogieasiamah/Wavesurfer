@@ -7,13 +7,29 @@ if(APPLE AND NOT CMAKE_OSX_ARCHITECTURES)
     set(CMAKE_OSX_ARCHITECTURES "x86_64;arm64" CACHE STRING "" FORCE)
 endif()
 
-project(WAVESURFER VERSION 1.1.0 LANGUAGES C CXX)
+# Windows: link the C++ runtime statically so users don't need the VC++ redistributable.
+set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+
+project(WAVESURFER VERSION 1.1.1 LANGUAGES C CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-# Point at a JUCE checkout:  git clone https://github.com/juce-framework/JUCE.git
-set(JUCE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/JUCE" CACHE PATH "Path to JUCE")
-add_subdirectory(${JUCE_PATH} JUCE)
+# JUCE 8.0.10 — the same release Flux 512 ships on, proven on macOS 10.13 and Windows.
+# (WaveSurfer 1.0/1.1 used JUCE 9 master, which crashed in REAPER on High Sierra.)
+# Uses -DJUCE_PATH=... or ./JUCE if present, otherwise downloads JUCE 8.0.10.
+set(JUCE_PATH "" CACHE PATH "Optional path to a JUCE 8.0.10 checkout")
+if(JUCE_PATH AND EXISTS ${JUCE_PATH}/CMakeLists.txt)
+    add_subdirectory(${JUCE_PATH} JUCE)
+elseif(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/JUCE/CMakeLists.txt)
+    add_subdirectory(JUCE)
+else()
+    include(FetchContent)
+    FetchContent_Declare(JUCE
+        GIT_REPOSITORY https://github.com/juce-framework/JUCE.git
+        GIT_TAG        8.0.10
+        GIT_SHALLOW    TRUE)
+    FetchContent_MakeAvailable(JUCE)
+endif()
 
 option(WAVESURFER_HEADLESS_LINUX "Disable optional X11 extensions/ALSA (CI or minimal Linux boxes)" OFF)
 option(WAVESURFER_SNAPSHOT_TOOL  "Build the UI snapshot renderer" OFF)
@@ -48,6 +64,7 @@ target_sources(WaveSurfer PRIVATE ${WAVESURFER_SOURCES})
 target_include_directories(WaveSurfer PRIVATE Source)
 
 set(WAVESURFER_DEFS
+    WAVESURFER_VERSION="${PROJECT_VERSION}"
     JUCE_WEB_BROWSER=0
     JUCE_USE_CURL=0
     JUCE_VST3_CAN_REPLACE_VST2=0
@@ -70,6 +87,18 @@ target_link_libraries(WaveSurfer
         juce::juce_recommended_config_flags
         juce::juce_recommended_lto_flags
         juce::juce_recommended_warning_flags)
+
+# ---- QRA generic extreme-parameter test (shared with Flux 512) ---------------
+option(WAVESURFER_PLUGIN_STRESS "Build the QRA generic plugin stress test" ON)
+if(WAVESURFER_PLUGIN_STRESS)
+    juce_add_console_app(WaveSurferPluginStress PRODUCT_NAME "WaveSurferPluginStress")
+    target_sources(WaveSurferPluginStress PRIVATE Tests/plugin_stress.cpp ${WAVESURFER_SOURCES})
+    target_include_directories(WaveSurferPluginStress PRIVATE Source)
+    target_compile_definitions(WaveSurferPluginStress PRIVATE ${WAVESURFER_DEFS}
+        JucePlugin_Build_Standalone=0 JUCE_STANDALONE_APPLICATION=1)
+    target_link_libraries(WaveSurferPluginStress PRIVATE WaveSurferAssets juce::juce_audio_utils
+        juce::juce_recommended_config_flags)
+endif()
 
 # ---- DSP quality check (no JUCE): every parameter at its extremes ----------
 add_executable(WaveSurferStressTest Tests/StressTest.cpp)
