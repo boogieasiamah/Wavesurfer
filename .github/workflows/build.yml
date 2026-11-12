@@ -178,12 +178,23 @@ jobs:
           rm -f ~/wavesurfer_reaper.txt
           /tmp/REAPER.app/Contents/MacOS/REAPER -nosplash -new "$PWD/Tests/reaper/wavesurfer_smoke.lua" > reaper_stdout.txt 2>&1 &
           PID=$!
-          for i in $(seq 1 150); do
+          # dismiss first-run dialogs ("select an audio device?" -> No)
+          ( for k in $(seq 1 20); do sleep 2
+              osascript -e 'tell application "System Events" to tell process "REAPER"
+                  repeat with w in windows
+                    if exists (button "No" of w) then click button "No" of w
+                    if exists (button "OK" of w) then click button "OK" of w
+                  end repeat
+                end tell' 2>&1 | head -2
+            done ) &
+          for i in $(seq 1 60); do
             sleep 2
             grep -q "SMOKE TEST DONE" ~/wavesurfer_reaper.txt 2>/dev/null && break
             if ! kill -0 $PID 2>/dev/null; then echo "REAPER EXITED (possible crash) after $((i*2)) s"; break; fi
           done
           screencapture -x reaper-screen.png || true
+          sips -s format jpeg -s formatOptions 60 -Z 1100 reaper-screen.png --out screen.jpg >/dev/null 2>&1 || true
+          echo "BEGIN_SCREEN_B64"; base64 -i screen.jpg | tr -d '\n'; echo; echo "END_SCREEN_B64"
           echo "----- smoke log"; cat ~/wavesurfer_reaper.txt 2>/dev/null || echo "(no log written)"
           echo "----- stdout"; tail -40 reaper_stdout.txt || true
           ALIVE=0; kill -0 $PID 2>/dev/null && ALIVE=1

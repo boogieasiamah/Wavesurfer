@@ -22,6 +22,8 @@ Brand: Quantum Research Audio. Free/research release.
 3. `WaveSurferSnapshot --editor-stress`: real windows opened/closed under audio + automation load.
 4. Sanitizer build of the stress test: `g++ -std=c++17 -O1 -g -fsanitize=address,undefined -ISource Tests/StressTest.cpp`.
 5. Zero warnings under `juce_recommended_warning_flags`.
+6. CI also runs REAPER 7.83 on macOS 15: loads VST3 + AU, extreme parameters, opens windows, renders.
+7. GitHub has no macOS 10.13 runner: check imports against the 10.13 SDK exports, and test on the real High Sierra Mac.
 
 ## Lessons learned (apply to future plugins)
 1. A scalar Kalman with fixed Q/R is just a one-pole. Set Q from a time constant: K = 1 − e^(−1/(τ·rate)), Q = K²R/(1−K).
@@ -53,3 +55,6 @@ Brand: Quantum Research Audio. Free/research release.
 21. A linear tilt cancels out of any "band vs neighbours" measure. To make a tilt control audible, tilt the decision
     thresholds per frequency as well as the input.
 22. Name the new behaviour, not the old knob: when a parameter changes meaning (Boost), add a new one (Output) for the old job.
+23. "Passes on macOS 15" says nothing about High Sierra. Check the x86_64 slice's imports against the 10.13 SDK .tbd
+    exports, keep it free of AVX/SSE4.2 (Apple's default x86_64 CPU is Penryn: SSE4.1), and test on the real machine.
+24. REAPER on a fresh CI machine stops at "You have not selected an audio device" - click No via osascript.

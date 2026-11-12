@@ -56,6 +56,10 @@ if(WAVESURFER_HEADLESS_LINUX)
     list(APPEND WAVESURFER_DEFS JUCE_USE_XRANDR=0 JUCE_USE_XINERAMA=0 JUCE_USE_XRENDER=0
                                 JUCE_USE_XCURSOR=0 JUCE_USE_XINPUT=0 JUCE_ALSA=0 JUCE_JACK=0)
 endif()
+set(WAVESURFER_EXTRA_DEFS "" CACHE STRING "Extra compile definitions (CI diagnostics), ;-separated")
+if(WAVESURFER_EXTRA_DEFS)
+    list(APPEND WAVESURFER_DEFS ${WAVESURFER_EXTRA_DEFS})
+endif()
 target_compile_definitions(WaveSurfer PUBLIC ${WAVESURFER_DEFS})
 
 target_link_libraries(WaveSurfer

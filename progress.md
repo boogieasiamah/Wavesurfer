@@ -1,5 +1,11 @@
 # WaveSurfer — progress
 
+## Open issue (2026-11-11): crash in REAPER on macOS 10.13 (VST3 and AU)
+- Not reproducible on macOS 15: REAPER 7.83 loads both formats, opens windows, renders, no crash (CI job `reaper`).
+- Ruled out: missing system symbols (all 590 imports exist in the 10.13 SDK), AVX/SSE4.2 code (SSE4.1 only),
+  Metal path (off by default), HarfBuzz/CoreText version branches (compile-time, classic path on 10.13).
+- Waiting on the macOS crash report from the High Sierra machine.
+
 ## v1.1 (2026-11-10)
 Researched how Gullfoss' Recover/Tame behave (manual + reviews) and closed the gaps.
 - Recover/Tame 0–200% (old values load unchanged; 30–50% is the gentle zone).
