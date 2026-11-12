@@ -56,6 +56,15 @@ jobs:
           rm -f ~/wavesurfer_reaper.txt
           /tmp/REAPER.app/Contents/MacOS/REAPER -nosplash -new "$PWD/Tests/reaper/wavesurfer_smoke.lua" > reaper_stdout.txt 2>&1 &
           PID=$!
+          # dismiss first-run dialogs ("select an audio device?" -> No)
+          ( for k in $(seq 1 20); do sleep 2
+              osascript -e 'tell application "System Events" to tell process "REAPER"
+                  repeat with w in windows
+                    if exists (button "No" of w) then click button "No" of w
+                    if exists (button "OK" of w) then click button "OK" of w
+                  end repeat
+                end tell' 2>&1 | head -2
+            done ) &
           for i in $(seq 1 45); do
             sleep 2
             grep -q "SMOKE TEST DONE" ~/wavesurfer_reaper.txt 2>/dev/null && break
