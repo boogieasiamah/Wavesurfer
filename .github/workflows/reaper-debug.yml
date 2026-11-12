@@ -1,0 +1,91 @@
+name: REAPER smoke (debug)
+
+on:
+  push:
+    branches: [reaper-debug]
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: "Build run to take WaveSurfer-macOS from"
+        required: false
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  reaper:
+    name: REAPER smoke test (load VST3 + AU, open windows, render)
+    runs-on: macos-15
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: WaveSurfer-macOS
+          path: dist
+          run-id: ${{ inputs.run_id || '43146091519' }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install WaveSurfer
+        run: |
+          cd dist && unzip -q WaveSurfer-*-macOS.zip && cd ..
+          D=$(ls -d dist/WaveSurfer-*/ | head -1)
+          mkdir -p ~/Library/Audio/Plug-Ins/VST3 ~/Library/Audio/Plug-Ins/Components
+          cp -R "$D/WaveSurfer.vst3" ~/Library/Audio/Plug-Ins/VST3/
+          cp -R "$D/WaveSurfer.component" ~/Library/Audio/Plug-Ins/Components/
+          xattr -dr com.apple.quarantine ~/Library/Audio/Plug-Ins || true
+          codesign --verify --deep --strict ~/Library/Audio/Plug-Ins/VST3/WaveSurfer.vst3
+          killall -9 AudioComponentRegistrar 2>/dev/null || true
+
+      - name: Install REAPER
+        run: |
+          for v in 783 782 781 780 779 778 777 776; do
+            if curl -fsSL -o reaper.dmg "https://www.reaper.fm/files/7.x/reaper${v}_universal.dmg"; then echo "REAPER $v"; break; fi
+          done
+          test -s reaper.dmg
+          yes | PAGER=cat hdiutil attach -nobrowse -noverify -mountpoint /tmp/reapervol reaper.dmg > /dev/null
+          APP=$(find /tmp/reapervol -maxdepth 2 -name "REAPER*.app" | head -1)
+          cp -R "$APP" /tmp/REAPER.app
+          hdiutil detach /tmp/reapervol -quiet || true
+          ls /tmp/REAPER.app/Contents/MacOS
+
+      - name: Run REAPER with WaveSurfer
+        run: |
+          rm -f ~/wavesurfer_reaper.txt
+          /tmp/REAPER.app/Contents/MacOS/REAPER -nosplash -new "$PWD/Tests/reaper/wavesurfer_smoke.lua" > reaper_stdout.txt 2>&1 &
+          PID=$!
+          for i in $(seq 1 45); do
+            sleep 2
+            grep -q "SMOKE TEST DONE" ~/wavesurfer_reaper.txt 2>/dev/null && break
+            if ! kill -0 $PID 2>/dev/null; then echo "REAPER EXITED (possible crash) after $((i*2)) s"; break; fi
+          done
+          screencapture -x reaper-screen.png || true
+          sips -s format jpeg -s formatOptions 60 -Z 1100 reaper-screen.png --out screen.jpg >/dev/null 2>&1 || true
+          echo "BEGIN_SCREEN_B64"; base64 -i screen.jpg | tr -d '\n'; echo; echo "END_SCREEN_B64"
+          echo "----- smoke log"; cat ~/wavesurfer_reaper.txt 2>/dev/null || echo "(no log written)"
+          echo "----- stdout"; tail -40 reaper_stdout.txt || true
+          ALIVE=0; kill -0 $PID 2>/dev/null && ALIVE=1
+          kill -9 $PID 2>/dev/null || true
+          ls -la ~/wavesurfer_render* 2>/dev/null || true
+          grep -q "SMOKE TEST DONE" ~/wavesurfer_reaper.txt
+          grep -q "VST3:WaveSurfer -> fx index [0-9]" ~/wavesurfer_reaper.txt
+          test "$ALIVE" = 1
+
+      - name: Crash reports + screen (on failure)
+        if: always()
+        run: |
+          ls -la ~/Library/Logs/DiagnosticReports/ 2>/dev/null | tail -20 || true
+          for f in ~/Library/Logs/DiagnosticReports/REAPER* ~/Library/Logs/DiagnosticReports/*WaveSurfer*; do
+            [ -f "$f" ] && { echo "=== $f"; head -200 "$f"; }
+          done || true
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: reaper-smoke
+          path: |
+            reaper-screen.png
+            reaper_stdout.txt
+            ~/wavesurfer_reaper.txt
