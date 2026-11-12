@@ -5,6 +5,9 @@
 - New Windows build: VST3 + Standalone x64, static MSVC runtime, Inno Setup installer.
 - Added the QRA generic extreme-parameter test from Flux 512 (548/548 pass locally; heaviest case 4% of real time).
 - CI now also checks every required import of the Intel binary against the macOS 10.13 SDK.
+  First run flagged kIOMainPortDefault and os_workgroup_join/leave/max_parallel_threads (macOS 11/12 only).
+  They are dead symbol-table entries left after LTO: no bind or lazy-bind fixup refers to them, so dyld never
+  resolves them. Flux 512 v0.2.3 (works on 10.13) has the same four. The check now counts only bound symbols.
 - Local (Linux, JUCE 8): DSP 73/73, QRA stress 548/548, host 14/14, zero warnings. Awaiting test on the 10.13 Mac.
 
 ## Issue (2026-11-11): v1.0/v1.1 crashed in REAPER on macOS 10.13 (VST3 and AU)

@@ -66,3 +66,6 @@ Brand: Quantum Research Audio. Free/research release.
 26. JUCE 8 vs 9 API: AudioPluginFormatManager::addFormat takes a raw pointer in 8; createEditorAndMakeActive is 9-only
     (use createEditorIfNeeded). JUCE 8's juceaide needs X11 extension headers on Linux even with JUCE_USE_X*=0:
     use stub headers via CPATH.
+27. Check imports from the dyld bind/lazy-bind tables, not `nm -u`. After LTO, Apple's linker leaves undefined
+    symbol-table entries that no fixup uses (JUCE 8: kIOMainPortDefault, os_workgroup_*); dyld never looks them up.
+    Validate the checker on a known-good binary (Flux 512 on 10.13) and on an empty SDK (must fail).
