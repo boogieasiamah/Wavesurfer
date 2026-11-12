@@ -152,6 +152,32 @@ int main(int argc, char** argv)
         }
     }
 
+   #if JUCE_MAC
+    // 6) what a DAW does when you open the plug-in: editor embedded in a real window
+    std::puts("[H6] editor in a real macOS window, audio + automation running");
+    {
+        plugin->prepareToPlay(48000, 512);
+        bool ok = true;
+        for (int k = 0; k < 3 && ok; ++k) {
+            std::unique_ptr<juce::AudioProcessorEditor> ed(plugin->createEditorAndMakeActive());
+            if (! ed) { ok = false; break; }
+            ed->addToDesktop(juce::ComponentPeer::windowHasTitleBar | juce::ComponentPeer::windowIsResizable);
+            ed->setVisible(true);
+            for (int t = 0; t < 60; ++t) {
+                for (auto* p : params) if (rng.nextInt(10) == 0) p->setValueNotifyingHost(rng.nextFloat());
+                juce::AudioBuffer<float> b(2, 512);
+                for (int c = 0; c < 2; ++c) for (int i = 0; i < 512; ++i) b.setSample(c, i, rng.nextFloat() - 0.5f);
+                plugin->processBlock(b, midi);
+                ok &= finite(b);
+                juce::MessageManager::getInstance()->runDispatchLoopUntil(16);
+            }
+            std::printf("  window %d: %dx%d ok\n", k, ed->getWidth(), ed->getHeight());
+            ed->removeFromDesktop();
+        }
+        EXPECT(ok, "editor survives a real window with audio running");
+    }
+   #endif
+
     plugin->releaseResources();
     plugin.reset();
     std::printf("\nHost test: %d passed, %d failed\n", passes, fails);
