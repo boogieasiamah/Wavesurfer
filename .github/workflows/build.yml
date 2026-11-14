@@ -76,6 +76,8 @@ jobs:
           "$SNAP" --editor-stress
           "$SNAP" ui-macos.png 2
           "$SNAP" ui-macos-pink.png 2 pink
+          "$SNAP" ui-macos-ref.png 2 track --ref-test
+          "$SNAP" --paint-bench
 
       - name: QC 6 — Apple auval (strict)
         run: |
@@ -139,6 +141,8 @@ jobs:
         run: |
           build\WaveSurferSnapshot_artefacts\Release\WaveSurferSnapshot.exe --editor-stress
           build\WaveSurferSnapshot_artefacts\Release\WaveSurferSnapshot.exe ui-windows.png 2
+          build\WaveSurferSnapshot_artefacts\Release\WaveSurferSnapshot.exe ui-windows-ref.png 2 track --ref-test
+          build\WaveSurferSnapshot_artefacts\Release\WaveSurferSnapshot.exe --paint-bench
 
       - name: Installer + zip
         shell: pwsh

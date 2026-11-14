@@ -56,7 +56,7 @@ juce::AudioProcessorValueTreeState::ParameterLayout WaveSurferProcessor::createP
     layout.add(std::make_unique<AudioParameterFloat>(ParameterID{"output", 1}, "Output",
         NormalisableRange<float>(-12.0f, 12.0f), 0.0f, db));
     layout.add(std::make_unique<AudioParameterChoice>(ParameterID{"reference", 1}, "Reference",
-        StringArray { "Ear (ISO 226)", "Pink Noise" }, 0));
+        StringArray { "Ear (ISO 226)", "Pink Noise", "Ref Track" }, 0));
     layout.add(std::make_unique<AudioParameterBool>(ParameterID{"lookahead", 1}, "Lookahead", false));
     layout.add(std::make_unique<AudioParameterFloat>(ParameterID{"amount", 1}, "Amount",
         NormalisableRange<float>(0.0f, 1.0f), 1.0f, pct));
@@ -74,6 +74,7 @@ juce::AudioProcessorValueTreeState::ParameterLayout WaveSurferProcessor::createP
 void WaveSurferProcessor::prepareToPlay(double sampleRate, int samplesPerBlock)
 {
     engine.prepare(sampleRate, samplesPerBlock);   // sets fs, snaps smoothers on first block
+    applyReferenceToEngine();                       // bands depend on the rate: re-map the stored curve
     reportedLatency = pLookahead->load() > 0.5f ? engine.getLookaheadSamples() : 0;
     pendingLatency = reportedLatency;
     setLatencySamples(reportedLatency);
@@ -108,7 +109,8 @@ void WaveSurferProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce::M
     p.bypass     = pBypass->load(std::memory_order_relaxed) > 0.5f;
     p.safetyClip = pClip->load(std::memory_order_relaxed) > 0.5f;
     p.outputDb   = pOutput->load(std::memory_order_relaxed);
-    p.reference  = pReference->load(std::memory_order_relaxed) > 0.5f ? wavesurfer::Reference::Pink : wavesurfer::Reference::Ear;
+    {   const int r = juce::roundToInt(pReference->load(std::memory_order_relaxed));
+        p.reference = r == 2 ? wavesurfer::Reference::Track : r == 1 ? wavesurfer::Reference::Pink : wavesurfer::Reference::Ear; }
     p.lookahead  = pLookahead->load(std::memory_order_relaxed) > 0.5f;
     engine.setParameters(p);
 
@@ -141,8 +143,113 @@ void WaveSurferProcessor::getStateInformation(juce::MemoryBlock& destData)
 void WaveSurferProcessor::setStateInformation(const void* data, int sizeInBytes)
 {
     if (auto xml = getXmlFromBinary(data, sizeInBytes))
-        if (xml->hasTagName(apvts.state.getType()))
+        if (xml->hasTagName(apvts.state.getType())) {
             apvts.replaceState(juce::ValueTree::fromXml(*xml));
+            restoreReferenceFromState();
+        }
+}
+
+// ---------------------------------------------------------------- Ref Track ----
+WaveSurferProcessor::~WaveSurferProcessor()
+{
+    cancelAnalysis = true;
+    if (analysisThread.joinable()) analysisThread.join();
+}
+
+juce::String WaveSurferProcessor::getRefName() const { return apvts.state.getProperty("refName").toString(); }
+juce::String WaveSurferProcessor::getRefError() const { return refError; }
+
+void WaveSurferProcessor::applyReferenceToEngine()
+{
+    std::lock_guard<std::mutex> lock(refMutex);
+    if (refF.size() >= 2 && refF.size() == refD.size()) engine.setReferenceCurve(refF.data(), refD.data(), (int) refF.size());
+    else engine.setReferenceCurve(nullptr, nullptr, 0);
+}
+
+void WaveSurferProcessor::storeReference(const juce::String& name, const std::vector<float>& f, const std::vector<float>& d)
+{
+    {
+        std::lock_guard<std::mutex> lock(refMutex);
+        refF = f; refD = d;
+    }
+    juce::String curve;
+    for (size_t i = 0; i < f.size(); ++i) curve << juce::String(f[i], 2) << ":" << juce::String(d[i], 3) << " ";
+    apvts.state.setProperty("refName", name, nullptr);
+    apvts.state.setProperty("refCurve", curve.trim(), nullptr);
+    applyReferenceToEngine();
+    refStatus = f.empty() ? (int) RefStatus::None : (int) RefStatus::Ready;
+}
+
+void WaveSurferProcessor::restoreReferenceFromState()
+{
+    std::vector<float> f, d;
+    for (auto& tok : juce::StringArray::fromTokens(apvts.state.getProperty("refCurve").toString(), " ", "")) {
+        const int c = tok.indexOfChar(':');
+        if (c <= 0) continue;
+        const float fv = tok.substring(0, c).getFloatValue(), dv = tok.substring(c + 1).getFloatValue();
+        if (std::isfinite(fv) && std::isfinite(dv) && fv > 0.0f) { f.push_back(fv); d.push_back(dv); }
+    }
+    {
+        std::lock_guard<std::mutex> lock(refMutex);
+        refF = f; refD = d;
+    }
+    applyReferenceToEngine();
+    refStatus = f.size() >= 2 ? (int) RefStatus::Ready : (int) RefStatus::None;
+}
+
+void WaveSurferProcessor::clearReference()
+{
+    cancelAnalysis = true;
+    if (analysisThread.joinable()) analysisThread.join();
+    storeReference({}, {}, {});
+    apvts.state.removeProperty("refName", nullptr);
+    apvts.state.removeProperty("refCurve", nullptr);
+}
+
+void WaveSurferProcessor::loadReferenceFile(const juce::File& file)
+{
+    cancelAnalysis = true;
+    if (analysisThread.joinable()) analysisThread.join();
+    cancelAnalysis = false;
+    refStatus = (int) RefStatus::Analysing;
+
+    juce::WeakReference<WaveSurferProcessor> weak(this);
+    analysisThread = std::thread([this, weak, file] {
+        juce::AudioFormatManager fm;
+        fm.registerBasicFormats();                                   // WAV, AIFF, FLAC, Ogg, MP3; CoreAudio formats on macOS
+        std::unique_ptr<juce::AudioFormatReader> reader(fm.createReaderFor(file));
+        std::vector<float> f(wavesurfer::WaveSurferEngine::NUM_BANDS), d(f.size());
+        juce::String err;
+        bool ok = false;
+        if (reader == nullptr) err = "Can't read this file type";
+        else if (reader->sampleRate < 22050.0 || reader->lengthInSamples < (juce::int64) (reader->sampleRate * 5.0))
+            err = "Reference must be at least 5 s long, 22 kHz or higher";
+        else {
+            auto an = std::make_unique<wavesurfer::WaveSurferEngine>();   // separate engine: same filter bank, same calibration
+            an->prepare(reader->sampleRate, 4096);
+            an->setParameters(wavesurfer::Params {});
+            an->beginAnalysis();
+            const juce::int64 maxLen = juce::jmin(reader->lengthInSamples, (juce::int64) (reader->sampleRate * 900.0));   // 15 min cap
+            juce::AudioBuffer<float> buf(2, 4096);
+            for (juce::int64 pos = 0; pos < maxLen && ! cancelAnalysis.load(); pos += 4096) {
+                const int n = (int) juce::jmin<juce::int64>(4096, maxLen - pos);
+                reader->read(&buf, 0, n, pos, true, reader->numChannels > 1);
+                if (reader->numChannels == 1) buf.copyFrom(1, 0, buf, 0, 0, n);
+                float* ch[2] = { buf.getWritePointer(0), buf.getWritePointer(1) };
+                an->process(ch, 2, n);
+            }
+            ok = ! cancelAnalysis.load() && an->getAnalysis(f.data(), d.data());
+            if (! ok && ! cancelAnalysis.load()) err = "Reference is silent";
+        }
+        if (cancelAnalysis.load()) return;
+        const auto name = file.getFileNameWithoutExtension();
+        juce::MessageManager::callAsync([weak, ok, f, d, err, name] {
+            auto* self = weak.get();
+            if (self == nullptr) return;
+            if (ok) self->storeReference(name, f, d);
+            else { { std::lock_guard<std::mutex> lock(self->refMutex); self->refError = err; } self->refStatus = (int) RefStatus::Failed; }
+        });
+    });
 }
 
 juce::AudioProcessorEditor* WaveSurferProcessor::createEditor()

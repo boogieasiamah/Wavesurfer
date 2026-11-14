@@ -1,5 +1,30 @@
 # WaveSurfer — progress
 
+## v1.2.0 (2026-11-13): no more low-mid build-up, Ref Track matching, GUI CPU fixed
+Measured with Tests/LowEndProbe (noise shapes, synthetic song, vocal over room boom), Tests/SpikeProbe and
+`WaveSurferSnapshot --paint-bench`.
+- **Muddy low-mid shift fixed.** Loudness make-up was K-weighted (BS.1770 counts 50 Hz almost like 1 kHz): when Tame
+  cut the kick, the make-up lifted 150-400 Hz by 1.2 dB. Make-up now follows equal loudness at 80 phon:
+  150-400 Hz +0.2 dB (new regression test T18 fails the old engine at +1.23 dB). LUFS may read up to ~1 dB lower
+  when a lot of sub is cut; perceived loudness holds within 0.1 dB (T11, independent 1/6-octave meter).
+- **Bells now deliver the curve.** The 16 bells were fitted by pairing + one overlap factor and delivered only ~half
+  the gain above 5 kHz and in the lows. Least-squares fit (precomputed 16x32 matrix): error vs requested curve
+  roughly halved (tilt 2.5 -> 1.2 dB, shelves 5.2 -> 2.6 dB at band centres). Same CPU.
+- Adaptive gains below 400 Hz move no faster than ~60 cycles of the band (follow the bass line, not each kick):
+  low-end gain swing on a kick+bass song 5.0 -> 2.1 dB p-p. Amount/Boost/limits keep their 40 ms response.
+- **Ref Track mode** (Ear | Pink | Ref): load a song (WAV/AIFF/FLAC/MP3/Ogg; M4A on Mac); a separate engine analyses its
+  long-term band balance on a worker thread with the same filter bank and pink calibration; Track mode steers toward
+  it (slope 1.0, 0.5 dB deadzone). Saved in the session (name + curve), re-mapped on sample-rate change. Balance error
+  vs a reference 5.1 -> 1.8 dB at Recover/Tame 100% (T19). Right-click LOAD REF to clear.
+- Output safety clamp at +24 dBFS (QRA rule 1.5) - exposed once the lows were delivered in full (+24.2 dBFS case).
+- **GUI CPU spike fixed.** The display redrew gradients, glow strokes on 240 points and the window background 30x/s:
+  6.5 ms/frame (20 % of a core) at 1x, 25 ms (77 %) on Retina. Now cached static layers, buffered background,
+  cached knob bodies (the blurred shadow), cheaper glow, and no repaint when nothing moved: 0.56 ms / 2.3 ms
+  (2 % / 7 %); full-window redraw 57 -> 5 ms. Pixel diff vs before: 0.07 % of pixels, max 42/255 at glow edges.
+  The audio engine itself is flat: worst block <= 1.6x median at fixed block sizes.
+- Tests: DSP 81/81 (ASan/UBSan clean), QRA stress 548/548, host 14/14, Ref Track round trip (in-process), zero warnings.
+- Comparison pack + Tests/compare_renders.py ready for Gullfoss / Smooth Operator renders (none published).
+
 ## v1.1.1 (2026-11-11): rebuilt on the Flux 512 setup — macOS 10.13+ and Windows
 - JUCE 9 master -> **JUCE 8.0.10** (FetchContent), the release Flux 512 runs on the same High Sierra Mac.
 - New Windows build: VST3 + Standalone x64, static MSVC runtime, Inno Setup installer.

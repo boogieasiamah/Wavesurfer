@@ -204,7 +204,7 @@ inline double kWeightPower(double f) noexcept {
 // ==============================================================================
 // PARAMETERS
 // ==============================================================================
-enum class Reference { Ear = 0, Pink = 1 };
+enum class Reference { Ear = 0, Pink = 1, Track = 2 };   // Track: match a loaded reference song
 
 struct Params {
     float recover  = 0.0f;   // 0..2 (200%)  lift masked / below-target bands
@@ -217,7 +217,7 @@ struct Params {
     float lowHz    = 20.0f;  // Recover/Tame limits (Boost is global)
     float highHz   = 20000.0f;
     Reference reference = Reference::Ear;
-    bool  gainMatch  = true;  // loudness preservation (predictive, K-weighted)
+    bool  gainMatch  = true;  // loudness preservation (predictive, equal loudness at 80 phon)
     bool  lookahead  = false; // 20 ms lookahead (adds reported latency)
     bool  delta      = false;
     bool  bypass     = false;
@@ -246,6 +246,8 @@ public:
         std::atomic<float> gainMatchDb { 0.0f };
         std::atomic<float> recoverDb { 0.0f }, tameDb { 0.0f }, brightDelta { 0.0f };
         std::atomic<int>   latency { 0 }, reference { 0 };
+        std::array<std::atomic<float>, NUM_BANDS> refTargetDb {};   // reference shape (mean 0), Track mode
+        std::atomic<bool>  refLoaded { false };
         std::atomic<uint32_t> counter { 0 };
     };
 
@@ -285,6 +287,9 @@ public:
             log2Freq[b]    = static_cast<float>(std::log2(fc));
             barkZ[b]       = static_cast<float>(barkOf(fc));
             kPow[b]        = static_cast<float>(kWeightPower(fc));
+            // loudness match follows the ear at mixing level, not BS.1770: K-weighting counts 50 Hz almost like
+            // 1 kHz, so cutting the kick made the make-up gain lift 150-400 Hz by ~1.2 dB (muddy)
+            loudW[b]       = static_cast<float>(std::pow(10.0, (iso226SplDb(1000.0, LOUDNESS_PHON) - iso226SplDb(fc, LOUDNESS_PHON)) / 10.0));
 
             // Boost table: equal-loudness balance at (70 + B) phon relative to 70 phon, 0 dB at 1 kHz
             for (int row = 0; row < BOOST_ROWS; ++row) {
@@ -337,14 +342,35 @@ public:
         for (int b = 0; b < NUM_BANDS; ++b)       // warped band->bell frequency ratios for the exact response
             for (int k = 0; k < NUM_BELLS; ++k)
                 wTab[b][k] = static_cast<float>(std::tan(3.14159265358979 * std::min((double) bandFreq[b], 0.4999 * fs) / fs) / bellG[k]);
-        {   // overlap compensation: all bells at +6 dB should read ~+6 dB mid-range
-            double sum = 0.0; int n = 0;
-            for (int i = 4; i < NUM_BELLS - 4; ++i) {
-                double tot = 0.0;
-                for (int j = 0; j < NUM_BELLS; ++j) tot += bellMagnitudeDb(bellFreq[i], bellFreq[j], bellQ, 6.0, fs);
-                sum += tot; ++n;
+        {   // least-squares fit of the 16 bells to the 32-band curve: G = (M^T M + l I)^-1 M^T, M = dB per dB.
+            // Replaces the old pairing + single overlap factor, which delivered only ~half the gain above
+            // 5 kHz (bilinear cramping) and in the low end; G is applied per update (512 MACs).
+            double M[NUM_BANDS][NUM_BELLS], A[NUM_BELLS][NUM_BELLS + NUM_BANDS];
+            for (int b = 0; b < NUM_BANDS; ++b)
+                for (int k = 0; k < NUM_BELLS; ++k)
+                    M[b][k] = bellMagnitudeDb(std::min((double) bandFreq[b], 0.4999 * fs), bellFreq[k], bellQ, 6.0, fs) / 6.0;
+            for (int i = 0; i < NUM_BELLS; ++i) {
+                for (int j = 0; j < NUM_BELLS; ++j) {
+                    double v = (i == j) ? FIT_REGULARISE : 0.0;
+                    for (int b = 0; b < NUM_BANDS; ++b) v += M[b][i] * M[b][j];
+                    A[i][j] = v;
+                }
+                for (int b = 0; b < NUM_BANDS; ++b) A[i][NUM_BELLS + b] = M[b][i];
             }
-            bellComp = static_cast<float>(6.0 / (sum / n));
+            for (int c = 0; c < NUM_BELLS; ++c) {                 // Gauss-Jordan with partial pivoting
+                int piv = c;
+                for (int r2 = c + 1; r2 < NUM_BELLS; ++r2) if (std::abs(A[r2][c]) > std::abs(A[piv][c])) piv = r2;
+                if (piv != c) for (int j = 0; j < NUM_BELLS + NUM_BANDS; ++j) std::swap(A[c][j], A[piv][j]);
+                const double d = A[c][c];
+                for (int j = 0; j < NUM_BELLS + NUM_BANDS; ++j) A[c][j] /= d;
+                for (int r2 = 0; r2 < NUM_BELLS; ++r2) {
+                    if (r2 == c) continue;
+                    const double m = A[r2][c];
+                    if (std::abs(m) > 0.0) for (int j = 0; j < NUM_BELLS + NUM_BANDS; ++j) A[r2][j] -= m * A[c][j];
+                }
+            }
+            for (int k = 0; k < NUM_BELLS; ++k)
+                for (int b = 0; b < NUM_BANDS; ++b) fitG[k][b] = static_cast<float>(A[k][NUM_BELLS + b]);
         }
 
         // ---- DC blocker (analysis path only, so the audio path can null) -----
@@ -366,6 +392,10 @@ public:
         sLook.prepare(fs, 0.02);
         auto coeff = [this](double tau) { return static_cast<float>(1.0 - std::exp(-1.0 / (tau * ctrlRate))); };
         gainSmoothCoeff = coeff(0.04);
+        for (int b = 0; b < NUM_BANDS; ++b) {    // adaptive part in the bass: >= LOW_GAIN_CYCLES cycles; fades out 200-400 Hz
+            const double f = bandFreq[b], fade = std::clamp((400.0 - f) / 200.0, 0.0, 1.0);
+            rawSlowCoeff[b] = coeff(std::max(0.001, fade * LOW_GAIN_CYCLES / f));
+        }
         gmGainCoeff     = coeff(0.3);
         meterCoeff      = coeff(0.25);
 
@@ -391,6 +421,7 @@ public:
             em1[i] = 0.0f; appliedBellDb[i] = 0.0f; bellActive[i] = false;
         }
         std::fill(std::begin(gainSmoothed), std::end(gainSmoothed), 0.0f);
+        std::fill(std::begin(rawSlow), std::end(rawSlow), 0.0f);
         std::fill(std::begin(gainTarget), std::end(gainTarget), 0.0f);
         std::fill(std::begin(levelDb), std::end(levelDb), -120.0f);
         std::fill(std::begin(slowDb), std::end(slowDb), -120.0f);
@@ -467,6 +498,43 @@ public:
     }
 
     const Snapshot& getSnapshot() const noexcept { return snap; }
+
+    // ---- Reference track (Track mode) ------------------------------------------
+    // The target is a long-term band balance, pink-calibrated (pink noise = flat), given as
+    // (frequency, dB) points from analyseReference(). Call after prepare(), from any non-audio
+    // thread: it only writes atomics. n < 2 clears the reference.
+    void setReferenceCurve(const float* freqHz, const float* db, int n) noexcept {
+        if (freqHz == nullptr || db == nullptr || n < 2) { refLoaded.store(false); snap.refLoaded.store(false); return; }
+        float t[NUM_BANDS]; float mean = 0.0f;
+        for (int b = 0; b < NUM_BANDS; ++b) {
+            const float lf = log2Freq[b];
+            int i = 0; while (i < n - 2 && std::log2(std::max(1.0f, freqHz[i + 1])) < lf) ++i;
+            const float l0 = std::log2(std::max(1.0f, freqHz[i])), l1 = std::log2(std::max(1.0f, freqHz[i + 1]));
+            const float u = std::clamp(l1 > l0 ? (lf - l0) / (l1 - l0) : 0.0f, 0.0f, 1.0f);   // hold the edges
+            float v = db[i] + u * (db[i + 1] - db[i]);
+            if (! std::isfinite(v)) v = 0.0f;
+            t[b] = std::clamp(v, -80.0f, 80.0f); mean += t[b];
+        }
+        mean /= NUM_BANDS;
+        for (int b = 0; b < NUM_BANDS; ++b) {
+            refTarget[(size_t) b].store(t[b] - mean, std::memory_order_relaxed);
+            snap.refTargetDb[(size_t) b].store(t[b] - mean, std::memory_order_relaxed);
+        }
+        refLoaded.store(true); snap.refLoaded.store(true);
+    }
+    bool hasReference() const noexcept { return refLoaded.load(); }
+
+    // Offline analysis: feed a song through a separate engine with analysis on, then read its
+    // long-term (power-averaged, silence-gated) band balance in the same calibration Track mode uses.
+    void beginAnalysis() noexcept { analysing = true; std::fill(std::begin(anaPow), std::end(anaPow), 0.0); anaCount = 0; }
+    bool getAnalysis(float* freqHz, float* db) const noexcept {   // NUM_BANDS entries each
+        if (anaCount < 10) return false;
+        for (int b = 0; b < NUM_BANDS; ++b) {
+            freqHz[b] = bandFreq[b];
+            db[b] = static_cast<float>(10.0 * std::log10(anaPow[b] / static_cast<double>(anaCount) + 1.0e-30) + 3.0103) - pinkRefDb[b];
+        }
+        return true;
+    }
     // GUI thread: read-and-reset peak meters (benign race: a lost reset only shows a peak twice)
     void takePeaks(float in[2], float out[2]) const noexcept {
         for (int c = 0; c < 2; ++c) {
@@ -501,7 +569,9 @@ public:
 
 private:
     static constexpr float  INPUT_CEILING = 1000.0f;        // +60 dBFS
+    static constexpr float  OUTPUT_CEILING = 15.8f;         // +23.97 dBFS: above anything a mix should reach
     // Ear mode gain law
+    static constexpr double LOUDNESS_PHON = 80.0;           // [estimate] typical mixing level for the loudness match
     static constexpr float  RECOVER_SLOPE = 1.0f;           // dB of lift per dB masked
     static constexpr float  TAME_SLOPE    = 1.2f;           // dB of cut per dB of prominence
     static constexpr float  TAME_DEADZONE = 1.0f;           // dB of prominence ignored
@@ -511,6 +581,10 @@ private:
     static constexpr float  PINK_SLOPE    = 0.7f;           // fraction of the deviation corrected
     static constexpr float  PINK_DEADZONE = 1.0f;           // dB around the pink line left alone
     static constexpr float  PINK_EMPTY_DB = 18.0f;          // deeper than this below target = intentionally empty
+    static constexpr double LOW_GAIN_CYCLES = 60.0;         // [estimate] adaptive gains move no faster than ~60 cycles of the band
+    static constexpr double FIT_REGULARISE = 0.01;          // bell fit: keeps gains tame where the curve is ill-posed
+    static constexpr float  TRACK_SLOPE    = 1.0f;          // Ref Track: fraction of the deviation corrected at 100%
+    static constexpr float  TRACK_DEADZONE = 0.5f;          // Ref Track: dB around the target left alone
     static constexpr float  BRIGHTEN_DB   = 6.0f;           // Brighten preference tilt at +-4 octaves from 1 kHz
     static constexpr float  BRIGHTEN_SPLIT_DB = 4.0f;       // Brighten also tilts the Recover/Tame split
     static constexpr double SLOPE_UP_DB_PER_BARK   = 12.0;  // masker spreading toward higher f
@@ -609,6 +683,9 @@ private:
             else if (exactly(byp, 0.0f)) { yl = wl; yr = wr; }
             else { yl = wl + byp * (dryL[i] - wl); yr = R ? wr + byp * (dryR[i] - wr) : 0.0f; }
             if (clipOn) { yl = transparentSoftClip(yl); yr = transparentSoftClip(yr); }
+            // safety stage, last operation (QRA rule 1.5): never non-finite, never above +24 dBFS
+            yl = std::isfinite(yl) ? std::clamp(yl, -OUTPUT_CEILING, OUTPUT_CEILING) : 0.0f;
+            yr = std::isfinite(yr) ? std::clamp(yr, -OUTPUT_CEILING, OUTPUT_CEILING) : 0.0f;
 
             L[i] = yl;
             peakOut[0] = std::max(peakOut[0], std::abs(yl));
@@ -684,10 +761,11 @@ private:
     }
 
     // Pink mode: pull the long-term balance toward pink noise (flat per band here)
+    // Track mode uses the same law with a reference song's balance as the target instead of flat.
     void pinkLaw(float recover, float tame, float bias, float brighten, const float* aud, const float* taper,
-                 bool gate, float* raw) const noexcept {
+                 bool gate, const float* target, float* raw) const noexcept {
         float v[NUM_BANDS];
-        for (int b = 0; b < NUM_BANDS; ++b) v[b] = slowDb[b] - brighten * BRIGHTEN_DB * tiltShape[b];
+        for (int b = 0; b < NUM_BANDS; ++b) v[b] = slowDb[b] - (target ? target[b] : 0.0f) - brighten * BRIGHTEN_DB * tiltShape[b];
         // robust level of the pink line: weighted mean, then again without empty/outlier bands
         float mean = 0.0f, ws = 0.0f;
         for (int b = 0; b < NUM_BANDS; ++b) { const float w = aud[b] * taper[b]; mean += w * v[b]; ws += w; }
@@ -700,11 +778,12 @@ private:
 
         for (int b = 0; b < NUM_BANDS; ++b) {
             const float d = v[b] - mean;                                         // + above pink, - below
-            const float under = std::max(0.0f, -d - PINK_DEADZONE + bias * BIAS_TAME_DB);
-            const float over  = std::max(0.0f,  d - PINK_DEADZONE - bias * BIAS_TAME_DB);
+            const float dz = target ? TRACK_DEADZONE : PINK_DEADZONE, sl = target ? TRACK_SLOPE : PINK_SLOPE;
+            const float under = std::max(0.0f, -d - dz + bias * BIAS_TAME_DB);
+            const float over  = std::max(0.0f,  d - dz - bias * BIAS_TAME_DB);
             const float empty = std::clamp((d + PINK_EMPTY_DB + 12.0f) / 12.0f, 0.0f, 1.0f);   // don't fill holes
-            const float gRec = recover * softLimit(PINK_SLOPE * under, MAX_GAIN_DB) * empty;
-            const float gTam = -tame * softLimit(PINK_SLOPE * over, MAX_GAIN_DB);
+            const float gRec = recover * softLimit(sl * under, MAX_GAIN_DB) * empty;
+            const float gTam = -tame * softLimit(sl * over, MAX_GAIN_DB);
             raw[b] = gRec * aud[b] + gTam;
         }
     }
@@ -749,6 +828,7 @@ private:
         for (int b = 0; b < NUM_BANDS; ++b) {
             const float ms = std::min(acc[b] * bandNorm[b] * invN, 1.0e12f);
             acc[b] = 0.0f;
+            anaMs[b] = ms;
             totalPow += ms;
             powS[b] += powCoeff[b] * (ms - powS[b]);
             slowPow[b] += slowCoeffB[b] * (ms - slowPow[b]);
@@ -758,6 +838,10 @@ private:
             P[b] = std::pow(10.0f, levelDb[b] * 0.1f);
         }
         const bool gate = totalPow > 1.0e-9f;   // ~ -90 dBFS total
+        if (analysing && gate) {                   // reference analysis (offline engine only)
+            for (int b = 0; b < NUM_BANDS; ++b) anaPow[b] += anaMs[b];
+            ++anaCount;
+        }
 
         // --- 2) audibility + limit taper ----------------------------------------
         float aud[NUM_BANDS], taper[NUM_BANDS];
@@ -773,9 +857,24 @@ private:
         if (exactly(recover, 0.0f) && exactly(tame, 0.0f))
             std::fill(raw, raw + NUM_BANDS, 0.0f);              // Bias/Brighten do nothing alone
         else if (reference == Reference::Pink)
-            pinkLaw(recover, tame, bias, brighten, aud, taper, gate, raw);
+            pinkLaw(recover, tame, bias, brighten, aud, taper, gate, nullptr, raw);
+        else if (reference == Reference::Track) {
+            if (refLoaded.load(std::memory_order_relaxed)) {
+                float tgt[NUM_BANDS];
+                for (int b = 0; b < NUM_BANDS; ++b) tgt[b] = refTarget[(size_t) b].load(std::memory_order_relaxed);
+                pinkLaw(recover, tame, bias, brighten, aud, taper, gate, tgt, raw);
+            } else std::fill(raw, raw + NUM_BANDS, 0.0f);   // nothing loaded yet: no correction
+        }
         else
             earLaw(recover, tame, bias, brighten, aud, gate, raw);
+
+        // --- 3b) low bands follow the bass line, not each kick: slow the adaptive part only ----
+        //     (Amount, Boost and the limits below keep their normal 40 ms response)
+        for (int b = 0; b < NUM_BANDS; ++b) {
+            float r = rawSlow[b] + rawSlowCoeff[b] * (raw[b] - rawSlow[b]);
+            if (std::abs(r - raw[b]) < 1.0e-4f || ! std::isfinite(r)) r = std::isfinite(raw[b]) ? raw[b] : 0.0f;
+            rawSlow[b] = r; raw[b] = r;
+        }
 
         // --- 4) curve: smooth across bands, limits, Boost, Amount ------------------
         for (int b = 0; b < NUM_BANDS; ++b) {
@@ -792,9 +891,10 @@ private:
 
         // --- 5) bell coefficients ---------------------------------------------
         for (int k = 0; k < NUM_BELLS; ++k) {
-            const float ga = gainSmoothed[2 * k], gb = gainSmoothed[2 * k + 1];
-            const float pair = (ga < 0.0f && gb < 0.0f) ? 0.35f * (ga + gb) + 0.3f * std::min(ga, gb) : 0.5f * (ga + gb);
-            const float gdb = std::clamp(bellComp * pair, -18.0f, 18.0f);
+            float fit = 0.0f;
+            for (int b = 0; b < NUM_BANDS; ++b) fit += fitG[k][b] * gainSmoothed[b];
+            if (std::abs(fit) < 0.005f || ! std::isfinite(fit)) fit = 0.0f;   // far-away bells stay off (CPU, exact null)
+            const float gdb = std::clamp(fit, -18.0f, 18.0f);
             appliedBellDb[k] = gdb;
             if (exactly(gdb, 0.0f)) { em1[k] = 0.0f; bellActive[k] = false; continue; }
             if (! bellActive[k]) {                       // waking up: start from clean state
@@ -822,8 +922,8 @@ private:
             }
         }
 
-        // --- 6) predictive loudness match (K-weighted, no feedback) ---------------
-        //     loudness_out / loudness_in = sum P K 10^(G/10) / sum P K. Exact when G == 0.
+        // --- 6) predictive loudness match (perceived loudness, no feedback) -------
+        //     loudness_out / loudness_in = sum P W 10^(G/10) / sum P W, W = equal loudness at 80 phon. Exact when G == 0.
         bool anyGain = false;
         for (int b = 0; b < NUM_BANDS; ++b) anyGain |= ! exactly(gainSmoothed[b], 0.0f);
         float sIn = 0.0f, sOutK = 0.0f, cIn = 0.0f, cOut = 0.0f, wIn = 0.0f, wOut = 0.0f;
@@ -831,7 +931,7 @@ private:
         if (anyGain && gate) {
             for (int b = 0; b < NUM_BANDS; ++b) {
                 const float gp = respPow[b];
-                sIn += P[b] * kPow[b]; sOutK += P[b] * kPow[b] * gp;
+                sIn += P[b] * loudW[b]; sOutK += P[b] * loudW[b] * gp;
                 const float pw = P[b] * weightLin[b];
                 cIn += barkZ[b] * pw; wIn += pw; cOut += barkZ[b] * pw * gp; wOut += pw * gp;
                 if (taper[b] > 0.5f) { nIn += 1.0f; recSum += std::max(0.0f, gainSmoothed[b]); tamSum += std::min(0.0f, gainSmoothed[b]); }
@@ -884,7 +984,11 @@ private:
     alignas(32) float bic1[NUM_BANDS] {}, bic2[NUM_BANDS] {}, acc[NUM_BANDS] {};
     float bandNorm[NUM_BANDS] {}, bandFreq[NUM_BANDS] {}, log2Freq[NUM_BANDS] {}, barkZ[NUM_BANDS] {};
     float weightDb[NUM_BANDS] {}, weightLin[NUM_BANDS] {}, thresholdDb[NUM_BANDS] {}, tiltShape[NUM_BANDS] {};
-    float mr0[NUM_BANDS] {}, kPow[NUM_BANDS] {};
+    float mr0[NUM_BANDS] {}, kPow[NUM_BANDS] {}, loudW[NUM_BANDS] {};
+    // reference track: target shape (written by message thread, read by audio thread) and offline analysis
+    std::array<std::atomic<float>, NUM_BANDS> refTarget {};
+    std::atomic<bool> refLoaded { false };
+    bool analysing = false; double anaPow[NUM_BANDS] {}; long anaCount = 0; float anaMs[NUM_BANDS] {};
     float aUp[NUM_BANDS] {}, aDn[NUM_BANDS] {};
     float levelDb[NUM_BANDS] {}, slowDb[NUM_BANDS] {}, gainTarget[NUM_BANDS] {}, gainSmoothed[NUM_BANDS] {};
     float powS[NUM_BANDS] {}, slowPow[NUM_BANDS] {}, powCoeff[NUM_BANDS] {}, slowCoeffB[NUM_BANDS] {};
@@ -896,12 +1000,13 @@ private:
     float bellFreq[NUM_BELLS] {}, bellG[NUM_BELLS] {}, appliedBellDb[NUM_BELLS] {};
     float ea1[NUM_BELLS] {}, ea2[NUM_BELLS] {}, ea3[NUM_BELLS] {}, em1[NUM_BELLS] {};
     float eic1[2][NUM_BELLS] {}, eic2[2][NUM_BELLS] {};
-    float bellComp = 1.0f;
+    float fitG[NUM_BELLS][NUM_BANDS] {};
     bool  bellActive[NUM_BELLS] {};
 
     std::vector<float> ring[2];
 
     float dcR = 0.999f, dcX1 = 0.0f, dcY1 = 0.0f;
+    float rawSlow[NUM_BANDS] {}, rawSlowCoeff[NUM_BANDS] {};
     float gainSmoothCoeff = 0.02f, gmGainCoeff = 0.002f, meterCoeff = 0.003f;
     float gmDb = 0.0f, gmGainCur = 1.0f, gmGainNext = 1.0f, gmStep = 0.0f;
     float recoverMeter = 0.0f, tameMeter = 0.0f, brightMeter = 0.0f;

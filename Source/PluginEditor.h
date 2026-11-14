@@ -37,7 +37,10 @@ private:
     std::unique_ptr<wsui::Knob> recover, tame, amount, bias, brighten, boost, output, lowLimit, highLimit;
     std::unique_ptr<wsui::Segmented> reference;
     juce::TextButton lookaheadBtn { "Lookahead" }, gainMatchBtn { "Loudness" }, deltaBtn { "Delta" },
-                     clipBtn { "Clip" }, bypassBtn { "Bypass" };
+                     clipBtn { "Clip" }, bypassBtn { "Bypass" }, loadRefBtn { "Load Ref" };
+    std::unique_ptr<juce::FileChooser> refChooser;
+    int refStatusShown = -1; juce::String refNameShown;
+    void chooseReference();
     std::vector<std::unique_ptr<juce::AudioProcessorValueTreeState::ButtonAttachment>> buttonAttachments;
     juce::TooltipWindow tooltips { this, 600 };
 

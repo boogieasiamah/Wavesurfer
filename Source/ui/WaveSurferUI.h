@@ -1,6 +1,7 @@
 #pragma once
 #include <juce_audio_utils/juce_audio_utils.h>
 #include "BinaryData.h"
+#include <map>
 #include "../PluginProcessor.h"
 
 // ==============================================================================
@@ -63,33 +64,23 @@ public:
     void drawRotarySlider(Graphics& g, int x, int y, int w, int h, float pos,
                           float start, float end, Slider& s) override {
         const bool bip = s.getProperties()["bipolar"];
+        const bool hover = s.isMouseOverOrDragging();
         const auto area = Rectangle<float>((float) x, (float) y, (float) w, (float) h);
         const float d = jmin(area.getWidth(), area.getHeight());
         const auto c = area.getCentre();
         const float r = d * 0.5f * 0.84f;               // arc radius
         const float br = r * 0.74f;                     // body radius
-        const float ang = start + pos * (end - start);
-        const float hover = s.isMouseOverOrDragging() ? 1.0f : 0.0f;
-
-        // 1) halo bloom (the audio-ui glow, cooled to the theme)
-        {
-            ColourGradient halo(Colour(0xFFB8D4FF).withAlpha(0.13f + 0.05f * hover), c,
-                                Colours::transparentBlack, c.translated(r * 1.22f, 0), true);
-            halo.addColour(0.55, Colour(0xFF7FA8FF).withAlpha(0.05f));
-            g.setGradientFill(halo);
-            g.fillEllipse(Rectangle<float>(r * 2.44f, r * 2.44f).withCentre(c));
-        }
-        // 2) track
         const float tw = jmax(2.0f, r * 0.075f);
-        Path track; track.addCentredArc(c.x, c.y, r, r, 0.0f, start, end, true);
-        g.setColour(Pal::gridHi.withAlpha(0.9f));
-        g.strokePath(track, PathStrokeType(tw, PathStrokeType::curved, PathStrokeType::rounded));
-        // tick marks at ends (+ centre for bipolar)
-        g.setColour(Pal::faint);
-        for (float a : { start, end }) g.drawLine(Line<float>(polar(c, r + tw * 1.1f, a), polar(c, r + tw * 2.0f, a)), 1.2f);
-        if (bip) g.drawLine(Line<float>(polar(c, r + tw * 1.1f, 0.5f * (start + end)), polar(c, r + tw * 2.2f, 0.5f * (start + end))), 1.4f);
+        const float ang = start + pos * (end - start);
 
-        // 3) value arc with glow
+        // static layers (halo, track, ticks / shadow, body) are cached per size, scale and hover:
+        // the blurred drop shadow alone cost more than the rest of the knob
+        const float sc = jmax(1.0f, g.getInternalContext().getPhysicalPixelScaleFactor());
+        auto& layers = knobLayers(w, h, sc, bip, hover, start, end);
+        const auto toArea = AffineTransform::scale(1.0f / sc).translated((float) x, (float) y);
+        g.drawImageTransformed(layers.under, toArea);
+
+        // value arc with glow (live)
         const float from = bip ? 0.5f * (start + end) : start;
         if (std::abs(ang - from) > 0.002f) {
             Path arc; arc.addCentredArc(c.x, c.y, r, r, 0.0f, jmin(from, ang), jmax(from, ang), true);
@@ -102,26 +93,9 @@ public:
             g.strokePath(arc, PathStrokeType(tw * 1.25f, PathStrokeType::curved, PathStrokeType::rounded));
         }
 
-        // 4) body: drop shadow, convex face, rim light
-        Path body; body.addEllipse(Rectangle<float>(br * 2, br * 2).withCentre(c));
-        DropShadow(Colours::black.withAlpha(0.75f), (int) (br * 0.45f), { 0, (int) (br * 0.16f) }).drawForPath(g, body);
-        {
-            ColourGradient face(Colour(0xFF2A3657), c.translated(-br * 0.35f, -br * 0.55f),
-                                Colour(0xFF070B15), c.translated(br * 0.5f, br * 0.95f), true);
-            g.setGradientFill(face);
-            g.fillPath(body);
-            ColourGradient rim(Colours::white.withAlpha(0.22f), c.translated(0, -br),
-                               Colours::white.withAlpha(0.0f), c.translated(0, br * 0.4f), false);
-            g.setGradientFill(rim);
-            g.drawEllipse(Rectangle<float>(br * 2 - 1.2f, br * 2 - 1.2f).withCentre(c), 1.2f);
-            // concave inner dish
-            const float ir = br * 0.80f;
-            ColourGradient dish(Colours::black.withAlpha(0.28f), c.translated(0, -ir),
-                                Colours::white.withAlpha(0.045f), c.translated(0, ir), false);
-            g.setGradientFill(dish);
-            g.fillEllipse(Rectangle<float>(ir * 2, ir * 2).withCentre(c));
-        }
-        // 5) pointer
+        g.drawImageTransformed(layers.over, toArea);
+
+        // pointer (live)
         const auto accent = bip && ang < from - 0.002f ? Pal::coral : Pal::teal;
         const auto p1 = polar(c, br * 0.36f, ang), p2 = polar(c, br * 0.80f, ang);
         g.setColour(accent.withAlpha(0.25f));
@@ -159,7 +133,56 @@ public:
     }
 
 private:
+    struct KnobLayers { Image under, over; };
+
+    KnobLayers& knobLayers(int w, int h, float sc, bool bip, bool hover, float start, float end) {
+        const auto key = String(w) + "x" + String(h) + "@" + String(sc, 3) + (bip ? "b" : "u") + (hover ? "h" : "n");
+        if (auto it = knobCache.find(key); it != knobCache.end()) return it->second;
+        if (knobCache.size() > 48) knobCache.clear();             // resizes, Retina/non-Retina moves
+
+        const int iw = jmax(1, (int) std::ceil((float) w * sc)), ih = jmax(1, (int) std::ceil((float) h * sc));
+        KnobLayers L { Image(Image::ARGB, iw, ih, true), Image(Image::ARGB, iw, ih, true) };
+        const auto area = Rectangle<float>(0.0f, 0.0f, (float) w, (float) h);
+        const float d = jmin(area.getWidth(), area.getHeight());
+        const auto c = area.getCentre();
+        const float r = d * 0.5f * 0.84f, br = r * 0.74f, tw = jmax(2.0f, r * 0.075f);
+        {
+            Graphics g(L.under); g.addTransform(AffineTransform::scale(sc));
+            ColourGradient halo(Colour(0xFFB8D4FF).withAlpha(0.13f + (hover ? 0.05f : 0.0f)), c,
+                                Colours::transparentBlack, c.translated(r * 1.22f, 0), true);
+            halo.addColour(0.55, Colour(0xFF7FA8FF).withAlpha(0.05f));
+            g.setGradientFill(halo);
+            g.fillEllipse(Rectangle<float>(r * 2.44f, r * 2.44f).withCentre(c));
+            Path track; track.addCentredArc(c.x, c.y, r, r, 0.0f, start, end, true);
+            g.setColour(Pal::gridHi.withAlpha(0.9f));
+            g.strokePath(track, PathStrokeType(tw, PathStrokeType::curved, PathStrokeType::rounded));
+            g.setColour(Pal::faint);
+            for (float a : { start, end }) g.drawLine(Line<float>(polar(c, r + tw * 1.1f, a), polar(c, r + tw * 2.0f, a)), 1.2f);
+            if (bip) g.drawLine(Line<float>(polar(c, r + tw * 1.1f, 0.5f * (start + end)), polar(c, r + tw * 2.2f, 0.5f * (start + end))), 1.4f);
+        }
+        {
+            Graphics g(L.over); g.addTransform(AffineTransform::scale(sc));
+            Path body; body.addEllipse(Rectangle<float>(br * 2, br * 2).withCentre(c));
+            DropShadow(Colours::black.withAlpha(0.75f), (int) (br * 0.45f), { 0, (int) (br * 0.16f) }).drawForPath(g, body);
+            ColourGradient face(Colour(0xFF2A3657), c.translated(-br * 0.35f, -br * 0.55f),
+                                Colour(0xFF070B15), c.translated(br * 0.5f, br * 0.95f), true);
+            g.setGradientFill(face);
+            g.fillPath(body);
+            ColourGradient rim(Colours::white.withAlpha(0.22f), c.translated(0, -br),
+                               Colours::white.withAlpha(0.0f), c.translated(0, br * 0.4f), false);
+            g.setGradientFill(rim);
+            g.drawEllipse(Rectangle<float>(br * 2 - 1.2f, br * 2 - 1.2f).withCentre(c), 1.2f);
+            const float ir = br * 0.80f;
+            ColourGradient dish(Colours::black.withAlpha(0.28f), c.translated(0, -ir),
+                                Colours::white.withAlpha(0.045f), c.translated(0, ir), false);
+            g.setGradientFill(dish);
+            g.fillEllipse(Rectangle<float>(ir * 2, ir * 2).withCentre(c));
+        }
+        return knobCache.emplace(key, std::move(L)).first->second;
+    }
+
     Theme& theme;
+    std::map<String, KnobLayers> knobCache;
 };
 
 // ------------------------------------------------------------------ knob ----
@@ -272,6 +295,8 @@ public:
         for (auto& h : hold) h = -90.0f;
     }
 
+    void setRefName(const String& n, bool analysing) { refName = n; refAnalysing = analysing; shownFlags = -1; }
+
     // called from the editor's timer (message thread)
     void update() {
         const auto& s = proc.getEngine().getSnapshot();
@@ -299,38 +324,75 @@ public:
         deltaOn = *proc.apvts.getRawParameterValue("delta") > 0.5f;
         bypassOn = *proc.apvts.getRawParameterValue("bypass") > 0.5f;
         pinkMode = s.reference.load(std::memory_order_relaxed) == 1;
+        trackMode = s.reference.load(std::memory_order_relaxed) == 2;
+        refLoaded = s.refLoaded.load(std::memory_order_relaxed);
+        for (int b = 0; b < NB; ++b) refDb[b] = s.refTargetDb[(size_t) b].load(std::memory_order_relaxed);
         topHz = s.sampleRate.load(std::memory_order_relaxed) * 0.45f;
-        repaint();
+
+        // repaint only when something visible moved (an idle or stopped session costs nothing)
+        float moved = 0.0f;
+        for (int b = 0; b < NB; ++b) moved = jmax(moved, std::abs(spec[b] - shownSpec[b]) * 0.1f);
+        for (int i = 0; i < NPTS; i += 4) moved = jmax(moved, std::abs(curve[i] - shownCurve[i]));
+        for (int i = 0; i < 4; ++i) moved = jmax(moved, std::abs(meter[i] - shownMeter[i]) * 0.1f, std::abs(hold[i] - shownHold[i]) * 0.1f);
+        const int visFlags = (gmOn ? 1 : 0) | (deltaOn ? 2 : 0) | (bypassOn ? 4 : 0) | (pinkMode ? 8 : 0) | (trackMode ? 16 : 0) | (refLoaded ? 32 : 0);
+        const float lo = lowHz(), hi = highHz();
+        if (moved > 0.01f || visFlags != shownFlags || std::abs(gmDb - shownGm) > 0.05f
+            || std::abs(lo - shownLo) > 0.01f || std::abs(hi - shownHi) > 0.01f) {
+            std::copy(std::begin(spec), std::end(spec), std::begin(shownSpec));
+            std::copy(std::begin(curve), std::end(curve), std::begin(shownCurve));
+            std::copy(std::begin(meter), std::end(meter), std::begin(shownMeter));
+            std::copy(std::begin(hold), std::end(hold), std::begin(shownHold));
+            shownFlags = visFlags; shownGm = gmDb; shownLo = lo; shownHi = hi;
+            repaint();
+        }
     }
 
     void paint(Graphics& g) override {
-        const auto bounds = getLocalBounds().toFloat();
-        // panel
-        {
-            ColourGradient bg(Colour(0xFF0C1630), bounds.getTopLeft(), Colour(0xFF070D1A), bounds.getBottomLeft(), false);
-            g.setGradientFill(bg);
-            g.fillRoundedRectangle(bounds, 18.0f);
-            ColourGradient sheen(Pal::blue.withAlpha(0.07f), bounds.getCentre().withY(bounds.getY()),
-                                 Colours::transparentBlack, bounds.getCentre().withY(bounds.getY() + bounds.getHeight() * 0.8f), true);
-            g.setGradientFill(sheen);
-            g.fillRoundedRectangle(bounds, 18.0f);
-            g.setColour(Pal::border);
-            g.drawRoundedRectangle(bounds.reduced(0.5f), 18.0f, 1.0f);
+        // static layer (panel, grid, axis labels, meter tracks) is drawn once per size and scale
+        const float sc = jmax(1.0f, g.getInternalContext().getPhysicalPixelScaleFactor());
+        if (staticLayer.isNull() || std::abs(staticScale - sc) > 1.0e-3f || staticSize != getLocalBounds().getBottomRight()) {
+            staticScale = sc; staticSize = getLocalBounds().getBottomRight();
+            staticLayer = Image(Image::ARGB, jmax(1, (int) std::ceil((float) getWidth() * sc)), jmax(1, (int) std::ceil((float) getHeight() * sc)), true);
+            Graphics sg(staticLayer); sg.addTransform(AffineTransform::scale(sc));
+            drawStatic(sg);
         }
+        g.drawImageTransformed(staticLayer, AffineTransform::scale(1.0f / sc));
+
+        const auto plot = plotArea();
+        {
+            Graphics::ScopedSaveState ss(g);
+            g.reduceClipRegion(plot.toNearestInt().expanded(0, 2));
+            drawSpectrum(g, plot);
+            if (pinkMode) drawPinkTarget(g, plot);
+            if (trackMode && refLoaded) drawRefTarget(g, plot);
+            drawLimits(g, plot);
+            drawCurve(g, plot);
+        }
+
+        drawLimitReadouts(g, plot);
+        drawBadges(g, plot);
+        drawMeters(g);
+    }
+
+    void drawStatic(Graphics& g) {
+        const auto bounds = getLocalBounds().toFloat();
+        ColourGradient bg(Colour(0xFF0C1630), bounds.getTopLeft(), Colour(0xFF070D1A), bounds.getBottomLeft(), false);
+        g.setGradientFill(bg);
+        g.fillRoundedRectangle(bounds, 18.0f);
+        ColourGradient sheen(Pal::blue.withAlpha(0.07f), bounds.getCentre().withY(bounds.getY()),
+                             Colours::transparentBlack, bounds.getCentre().withY(bounds.getY() + bounds.getHeight() * 0.8f), true);
+        g.setGradientFill(sheen);
+        g.fillRoundedRectangle(bounds, 18.0f);
+        g.setColour(Pal::border);
+        g.drawRoundedRectangle(bounds.reduced(0.5f), 18.0f, 1.0f);
         const auto plot = plotArea();
         {
             Graphics::ScopedSaveState ss(g);
             g.reduceClipRegion(plot.toNearestInt().expanded(0, 2));
             drawGrid(g, plot);
-            drawSpectrum(g, plot);
-            if (pinkMode) drawPinkTarget(g, plot);
-            drawLimits(g, plot);
-            drawCurve(g, plot);
         }
-
-        drawLabels(g, plot);
-        drawBadges(g, plot);
-        drawMeters(g);
+        drawAxisLabels(g, plot);
+        drawMeterFrame(g);
     }
 
     // ---- limit handles ------------------------------------------------------
@@ -432,6 +494,23 @@ private:
         g.drawText("PINK TARGET", Rectangle<float>(xOf(lo) + 10, y - 16, 90, 12), Justification::centredLeft);
     }
 
+    // Ref mode: the reference song's long-term balance, placed at the mix's mean level inside the limits
+    void drawRefTarget(Graphics& g, Rectangle<float>) {
+        const float lo = jmin(lowHz(), highHz()), hi = jmax(lowHz(), highHz());
+        float sum = 0.0f, rs = 0.0f; int n = 0;
+        for (int b = 0; b < NB; ++b) if (freqs[b] >= lo && freqs[b] <= hi && spec[b] > -100.0f) { sum += spec[b]; rs += refDb[b]; ++n; }
+        if (n == 0) return;
+        const float off = (sum - rs) / (float) n;
+        std::vector<Point<float>> pts;
+        for (int b = 0; b < NB; ++b) if (freqs[b] > 0.0f && freqs[b] <= 20000.0f) pts.push_back({ xOf(freqs[b]), ySpec(off + refDb[b]) });
+        Path line = smoothPath(pts), dashed;
+        const float dash[] = { 7.0f, 5.0f };
+        PathStrokeType(1.6f).createDashedStroke(dashed, line, dash, 2);
+        g.setColour(Pal::amber.withAlpha(0.85f)); g.fillPath(dashed);
+        g.setFont(theme.font(theme.semibold, 9.5f, 0.12f));
+        if (! pts.empty()) g.drawText("REF TARGET", Rectangle<float>(pts[pts.size() / 3].x + 8, pts[pts.size() / 3].y - 18, 90, 12), Justification::centredLeft);
+    }
+
     void drawLimits(Graphics& g, Rectangle<float> p) {
         const float lx = xOf(jmin(lowHz(), highHz())), hx = xOf(jmax(lowHz(), highHz()));
         if (lx > p.getX() + 0.5f) {
@@ -475,14 +554,20 @@ private:
             ColourGradient dn(Pal::coral.withAlpha(0.04f * alpha), 0, y0, Pal::coral.withAlpha(0.30f * alpha), 0, p.getBottom(), false);
             g.setGradientFill(dn); g.fillPath(fill);
         }
-        g.setColour(Pal::teal.withAlpha(0.10f * alpha)); g.strokePath(line, PathStrokeType(9.0f, PathStrokeType::curved, PathStrokeType::rounded));
-        g.setColour(Pal::teal.withAlpha(0.22f * alpha)); g.strokePath(line, PathStrokeType(4.0f, PathStrokeType::curved, PathStrokeType::rounded));
+        Path glow;                                             // the wide glow doesn't need every point
+        for (int i = 0; i < NPTS; i += 3) {
+            const float x = p.getX() + p.getWidth() * (float) i / (float) (NPTS - 1), y = yEq(curve[i]);
+            if (i == 0) glow.startNewSubPath(x, y); else glow.lineTo(x, y);
+        }
+        glow.lineTo(p.getRight(), yEq(curve[NPTS - 1]));
+        g.setColour(Pal::teal.withAlpha(0.10f * alpha)); g.strokePath(glow, PathStrokeType(9.0f, PathStrokeType::beveled, PathStrokeType::rounded));
+        g.setColour(Pal::teal.withAlpha(0.22f * alpha)); g.strokePath(glow, PathStrokeType(4.0f, PathStrokeType::beveled, PathStrokeType::rounded));
         ColourGradient core(Colours::white.withAlpha(alpha), p.getX(), 0, Pal::teal.brighter(0.3f).withAlpha(alpha), p.getRight(), 0, false);
         core.addColour(0.5, Colour(0xFFBFF6EE).withAlpha(alpha));
-        g.setGradientFill(core); g.strokePath(line, PathStrokeType(1.9f, PathStrokeType::curved, PathStrokeType::rounded));
+        g.setGradientFill(core); g.strokePath(line, PathStrokeType(1.9f, PathStrokeType::beveled, PathStrokeType::rounded));
     }
 
-    void drawLabels(Graphics& g, Rectangle<float> p) {
+    void drawAxisLabels(Graphics& g, Rectangle<float> p) {
         g.setFont(theme.font(theme.medium, 10.0f, 0.04f));
         g.setColour(Pal::dim.withAlpha(0.85f));
         const std::pair<double, const char*> fl[] = { {20,"20"},{50,"50"},{100,"100"},{200,"200"},{500,"500"},{1000,"1k"},{2000,"2k"},{5000,"5k"},{10000,"10k"},{20000,"20k"} };
@@ -496,8 +581,9 @@ private:
         }
         g.setColour(Pal::faint);
         g.drawText("dB", Rectangle<float>(4, p.getY() - 16, 34, 12), Justification::centredRight);
+    }
 
-        // limit readouts
+    void drawLimitReadouts(Graphics& g, Rectangle<float> p) {
         g.setFont(theme.font(theme.semibold, 10.0f, 0.06f));
         g.setColour(Pal::coral);
         auto fmt = [](float hz) { return hz >= 1000.0f ? String(hz / 1000.0f, 1) + " kHz" : String(roundToInt(hz)) + " Hz"; };
@@ -519,7 +605,12 @@ private:
             const String s = "LOUDNESS " + String(gmDb >= 0 ? "+" : "") + String(gmDb, 1) + " dB";
             x -= 132; drawBadge(g, { x, p.getBottom() - 28, 132, 18 }, s, Pal::teal); x -= 8;
         }
-        if (deltaOn) { x -= 64; drawBadge(g, { x, p.getBottom() - 28, 64, 18 }, "DELTA", Pal::amber); }
+        if (deltaOn) { x -= 64; drawBadge(g, { x, p.getBottom() - 28, 64, 18 }, "DELTA", Pal::amber); x -= 8; }
+        if (trackMode) {
+            const String s = refAnalysing ? "ANALYSING REFERENCE" : refLoaded ? "REF  " + refName.substring(0, 28).toUpperCase() : "NO REFERENCE - LOAD ONE";
+            const float w = jmin(260.0f, 26.0f + 6.6f * (float) s.length());
+            x -= w; drawBadge(g, { x, p.getBottom() - 28, w, 18 }, s, Pal::amber);
+        }
         if (bypassOn) {
             g.setFont(theme.font(theme.semibold, 13.0f, 0.4f));
             g.setColour(Pal::text.withAlpha(0.55f));
@@ -527,17 +618,36 @@ private:
         }
     }
 
-    void drawMeters(Graphics& g) {
+    Rectangle<float> meterColumn() const {
         const auto b = getLocalBounds().toFloat();
-        auto col = Rectangle<float>(b.getRight() - 92, b.getY() + 18, 74, b.getHeight() - 48);
+        return Rectangle<float>(b.getRight() - 92, b.getY() + 18, 74, b.getHeight() - 48);
+    }
+
+    void drawMeterFrame(Graphics& g) {
+        const auto col = meterColumn();
         g.setColour(Pal::border); g.drawVerticalLine(roundToInt(col.getX() - 6), col.getY(), col.getBottom());
+        auto bars = col.withTrimmedBottom(26).withTrimmedTop(2);
+        auto yOfDb = [&](float db) { return bars.getBottom() - jlimit(0.0f, 1.0f, (db + 60.0f) / 66.0f) * bars.getHeight(); };
+        const float xs[4] = { col.getX() + 6, col.getX() + 15, col.getX() + 53, col.getX() + 62 };
+        for (int i = 0; i < 4; ++i) { g.setColour(Pal::grid); g.fillRoundedRectangle(Rectangle<float>(xs[i], bars.getY(), 6.0f, bars.getHeight()), 3.0f); }
+        g.setFont(theme.font(theme.regular, 8.5f));
+        for (int db : { 0, -12, -24, -48 }) {
+            g.setColour(Pal::faint);
+            g.drawText(String(db), Rectangle<float>(col.getX() + 23, yOfDb((float) db) - 6, 28, 12), Justification::centred);
+        }
+        g.setFont(theme.caps(9.0f)); g.setColour(Pal::dim);
+        g.drawText("IN", Rectangle<float>(col.getX() - 4, col.getBottom() - 22, 37, 12), Justification::centred);
+        g.drawText("OUT", Rectangle<float>(col.getX() + 43, col.getBottom() - 22, 37, 12), Justification::centred);
+    }
+
+    void drawMeters(Graphics& g) {
+        const auto col = meterColumn();
         auto bars = col.withTrimmedBottom(26).withTrimmedTop(2);
         auto yOfDb = [&](float db) { return bars.getBottom() - jlimit(0.0f, 1.0f, (db + 60.0f) / 66.0f) * bars.getHeight(); };
         const float bw = 6.0f;
         const float xs[4] = { col.getX() + 6, col.getX() + 15, col.getX() + 53, col.getX() + 62 };
         for (int i = 0; i < 4; ++i) {
             auto track = Rectangle<float>(xs[i], bars.getY(), bw, bars.getHeight());
-            g.setColour(Pal::grid); g.fillRoundedRectangle(track, 3.0f);
             const float top = yOfDb(meter[i]);
             if (top < bars.getBottom() - 0.5f) {
                 // colour stops by level: teal -> light blue (-12) -> amber (-3) -> coral (0 dBFS and up)
@@ -552,15 +662,6 @@ private:
             const float hy = yOfDb(hold[i]);
             if (hold[i] > -59.0f) { g.setColour(hold[i] > 0.0f ? Pal::coral : Pal::text.withAlpha(0.8f)); g.fillRect(xs[i], hy - 1.0f, bw, 2.0f); }
         }
-        // scale ticks
-        g.setFont(theme.font(theme.regular, 8.5f));
-        for (int db : { 0, -12, -24, -48 }) {
-            g.setColour(Pal::faint);
-            g.drawText(String(db), Rectangle<float>(col.getX() + 23, yOfDb((float) db) - 6, 28, 12), Justification::centred);
-        }
-        g.setFont(theme.caps(9.0f)); g.setColour(Pal::dim);
-        g.drawText("IN", Rectangle<float>(col.getX() - 4, col.getBottom() - 22, 37, 12), Justification::centred);
-        g.drawText("OUT", Rectangle<float>(col.getX() + 43, col.getBottom() - 22, 37, 12), Justification::centred);
         g.setFont(theme.value(10.0f)); g.setColour(Pal::text.withAlpha(0.85f));
         auto txt = [](float db) { return db <= -59.5f ? String("-inf") : String(db, 1); };
         g.drawText(txt(jmax(hold[0], hold[1])), Rectangle<float>(col.getX() - 4, col.getBottom() - 10, 37, 12), Justification::centred);
@@ -574,8 +675,13 @@ private:
     float freqs[NB] {}, spec[NB] {}, curve[NPTS] {};
     float meter[4] {}, hold[4] {}; int holdAge[4] {};
     float gmDb = 0.0f, topHz = 20000.0f;
-    bool gmOn = false, deltaOn = false, bypassOn = false, pinkMode = false;
+    bool gmOn = false, deltaOn = false, bypassOn = false, pinkMode = false, trackMode = false, refLoaded = false, refAnalysing = false;
+    float refDb[NB] {}; String refName;
     int dragging = 0;
+    // what is on screen now (repaint only when it changes) and the cached static layer
+    float shownSpec[NB] {}, shownCurve[NPTS] {}, shownMeter[4] {}, shownHold[4] {};
+    float shownGm = 0.0f, shownLo = -1.0f, shownHi = -1.0f; int shownFlags = -1;
+    Image staticLayer; float staticScale = 0.0f; Point<int> staticSize;
 };
 
 // ------------------------------------------------------------------- logo ----

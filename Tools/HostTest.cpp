@@ -78,7 +78,8 @@ int main(int argc, char** argv)
     // 2) state round trip (VST3 delivers parameter changes on the next process call)
     std::puts("[H2] state save / restore");
     auto pump = [&] { juce::AudioBuffer<float> b(2, 64); b.clear(); plugin->processBlock(b, midi); };
-    auto randomise = [&] { for (auto* p : params) { const float r = rng.nextFloat(); p->setValue(p->getNumSteps() == 2 ? std::round(r) : r); } pump(); };
+    auto randomise = [&] { for (auto* p : params) { const float r = rng.nextFloat(); const int st = p->getNumSteps();
+        p->setValue(st > 1 && st < 64 ? std::round(r * (float) (st - 1)) / (float) (st - 1) : r); } pump(); };   // stepped params: valid steps
     plugin->prepareToPlay(48000, 512);
     randomise();
     juce::MemoryBlock state; plugin->getStateInformation(state);

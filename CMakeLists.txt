@@ -10,7 +10,7 @@ endif()
 # Windows: link the C++ runtime statically so users don't need the VC++ redistributable.
 set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 
-project(WAVESURFER VERSION 1.1.1 LANGUAGES C CXX)
+project(WAVESURFER VERSION 1.2.0 LANGUAGES C CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 

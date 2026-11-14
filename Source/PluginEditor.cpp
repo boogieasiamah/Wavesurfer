@@ -9,6 +9,7 @@ WaveSurferEditor::WaveSurferEditor(WaveSurferProcessor& p)
 {
     setLookAndFeel(&lnf);
     addAndMakeVisible(canvas);
+    canvas.setBufferedToImage(true);   // background gradients drawn once, not behind every display frame
     canvas.setLookAndFeel(&lnf);
     canvas.addAndMakeVisible(display);
 
@@ -36,12 +37,19 @@ WaveSurferEditor::WaveSurferEditor(WaveSurferProcessor& p)
         buttonAttachments.push_back(std::make_unique<AudioProcessorValueTreeState::ButtonAttachment>(s, id, b));
     };
     pill(lookaheadBtn, "lookahead", false, "20 ms lookahead: smoother on transients, adds 20 ms latency (reported to the host).");
-    pill(gainMatchBtn, "gainMatch", false, "Keeps perceived (K-weighted) loudness equal to the input, for honest A/B.");
+    pill(gainMatchBtn, "gainMatch", false, "Keeps perceived loudness (equal loudness at mixing level) equal to the input, for honest A/B.");
     if (auto* refParam = s.getParameter("reference")) {
-        reference = std::make_unique<wsui::Segmented>(theme, *refParam, StringArray { "Ear  ISO 226", "Pink Noise" });
-        reference->setTooltip("Ear: unmask by how we hear (ISO 226 + masking). Pink: pull the long-term balance toward pink noise.");
+        reference = std::make_unique<wsui::Segmented>(theme, *refParam, StringArray { "Ear", "Pink", "Ref" });
+        reference->setTooltip("Ear: unmask by how we hear (ISO 226 + masking). Pink: pull the long-term balance toward pink noise. "
+                              "Ref: pull it toward a reference song you load.");
         canvas.addAndMakeVisible(*reference);
     }
+    loadRefBtn.setTooltip("Load a reference song (WAV, AIFF, FLAC, MP3; M4A on Mac). Its long-term tonal balance becomes the target "
+                          "in Ref mode. Saved with the session. Right-click to clear.");
+    loadRefBtn.onClick = [this] {
+        if (ModifierKeys::currentModifiers.isPopupMenu()) { proc.clearReference(); return; }
+        chooseReference(); };
+    canvas.addAndMakeVisible(loadRefBtn);
     pill(deltaBtn,     "delta",     false, "Listen only to what WaveSurfer changes.");
     pill(clipBtn,      "clip",      false, "Transparent safety clipper on the output (unity below -0.9 dBFS).");
     pill(bypassBtn,    "bypass",    true,  "Click-free bypass.");
@@ -60,6 +68,23 @@ WaveSurferEditor::~WaveSurferEditor()
     setLookAndFeel(nullptr);
 }
 
+void WaveSurferEditor::chooseReference()
+{
+    refChooser = std::make_unique<FileChooser>("Choose a reference song", File(),
+                                               "*.wav;*.aif;*.aiff;*.flac;*.mp3;*.ogg;*.m4a;*.caf");
+    Component::SafePointer<WaveSurferEditor> safe(this);
+    refChooser->launchAsync(FileBrowserComponent::openMode | FileBrowserComponent::canSelectFiles,
+        [safe](const FileChooser& fc) {
+            if (safe == nullptr) return;
+            const auto f = fc.getResult();
+            if (f.existsAsFile()) {
+                safe->proc.loadReferenceFile(f);
+                if (auto* p = safe->proc.apvts.getParameter("reference"))   // switch to Ref mode so the load does something
+                    p->setValueNotifyingHost(p->convertTo0to1(2.0f));
+            }
+        });
+}
+
 void WaveSurferEditor::resized()
 {
     const float scale = (float) getWidth() / (float) baseW;
@@ -67,13 +92,14 @@ void WaveSurferEditor::resized()
     canvas.setTransform(AffineTransform::scale(scale));
 
     // header: reference switch + pills (right aligned)
-    if (reference) reference->setBounds(338, 22, 228, 30);
+    if (reference) reference->setBounds(300, 22, 204, 30);
+    loadRefBtn.setBounds(510, 22, 92, 30);
     int x = baseW - 28;
     for (auto* b : { &bypassBtn, &clipBtn, &deltaBtn, &gainMatchBtn, &lookaheadBtn }) {
-        const int w = b == &bypassBtn ? 78 : b == &clipBtn ? 62 : b == &deltaBtn ? 70 : b == &gainMatchBtn ? 96 : 106;
+        const int w = b == &bypassBtn ? 74 : b == &clipBtn ? 56 : b == &deltaBtn ? 64 : b == &gainMatchBtn ? 90 : 96;
         x -= w;
         b->setBounds(x, 22, w, 30);
-        x -= b == &bypassBtn ? 16 : 8;
+        x -= b == &bypassBtn ? 12 : 6;
     }
 
     display.setBounds(24, 72, baseW - 48, 320);
@@ -106,6 +132,19 @@ void WaveSurferEditor::refresh()
     const float fsNow = snap.sampleRate.load(std::memory_order_relaxed);
     const int ms = roundToInt(1000.0f * (float) snap.latency.load(std::memory_order_relaxed) / jmax(1.0f, fsNow));
     if (ms != latencyMsShown) { latencyMsShown = ms; canvas.repaint(baseW - 460, baseH - 26, 440, 20); }
+
+    const int st = (int) proc.getRefStatus();
+    const auto nm = proc.getRefName();
+    if (st != refStatusShown || nm != refNameShown) {
+        refStatusShown = st; refNameShown = nm;
+        using RS = WaveSurferProcessor::RefStatus;
+        loadRefBtn.setButtonText(st == (int) RS::Analysing ? "Analysing" : st == (int) RS::Failed ? "Load failed" : "Load Ref");
+        loadRefBtn.setTooltip(st == (int) RS::Ready ? "Reference: " + nm + ". Click to load another, right-click to clear."
+                            : st == (int) RS::Failed ? proc.getRefError() + ". Click to try another file."
+                            : "Load a reference song (WAV, AIFF, FLAC, MP3; M4A on Mac). Its long-term tonal balance becomes the "
+                              "target in Ref mode. Saved with the session. Right-click to clear.");
+        display.setRefName(st == (int) RS::Ready ? nm : String(), st == (int) RS::Analysing);
+    }
 }
 
 void WaveSurferEditor::Canvas::paint(Graphics& g)

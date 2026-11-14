@@ -11,13 +11,15 @@ Brand: Quantum Research Audio. Free/research release.
 - Control rate (~1.5 kHz, N = fs/1500 samples): Kalman (dB), ISO 226 weighting, two-pass
   spreading (O(N)), gain law, bell coefficients, gain match.
 - Audio is processed in chunks aligned to control blocks, so output is bit-identical at any host block size.
-- Two references: Ear (ISO 226 + Bark masking, fast) and Pink (long-term balance vs pink, slow, power-averaged).
+- Three references: Ear (ISO 226 + Bark masking, fast), Pink (long-term balance vs pink, slow, power-averaged) and
+  Ref Track (same law as Pink, target = a loaded song analysed by a separate engine instance; curve saved in state).
 - Zero latency by default; optional 20 ms lookahead (delay line always runs; latency reported via AsyncUpdater).
   Dry is taken after the delay, so delta and bypass stay aligned.
-- Loudness match is predictive: K-weighted band power x exact bell response at band centres. No feedback loop.
+- Loudness match is predictive: band power x equal loudness at 80 phon x exact bell response at band centres.
+- Bells are fitted to the 32-band curve by least squares (matrix precomputed in prepare), not by pairing.
 
 ## Quality protocol (run before every release)
-1. `WaveSurferStressTest` (73 checks): all 256 parameter corners x 6 signals x modes, NaN/inf/1e30 injection,
+1. `WaveSurferStressTest` (81 checks): all 256 parameter corners x 6 signals x modes, NaN/inf/1e30 injection,
    22.05k–384k x block sizes 1–8192, automation torture, nulls, denormals, 60 s long run, CPU.
 2. `WaveSurferHostTest` on the built VST3: random extreme automation, state round trip, mono, editor lifecycle,
    lookahead latency reported to the host.
@@ -69,3 +71,16 @@ Brand: Quantum Research Audio. Free/research release.
 27. Check imports from the dyld bind/lazy-bind tables, not `nm -u`. After LTO, Apple's linker leaves undefined
     symbol-table entries that no fixup uses (JUCE 8: kIOMainPortDefault, os_workgroup_*); dyld never looks them up.
     Validate the checker on a known-good binary (Flux 512 on 10.13) and on an empty SDK (must fail).
+28. Don't match loudness with K-weighting inside a tonal processor. BS.1770 counts 50 Hz almost like 1 kHz, so cutting
+    the kick made the broadband make-up lift 150-400 Hz (+1.2 dB, "muddy"). Match equal loudness at mixing level.
+29. Verify what the filters deliver, not what the law asks for. Pairing 32 bands onto 16 bells with one overlap factor
+    delivered half the gain above 5 kHz (bilinear cramping) and in the lows. Least-squares fit the bells.
+30. When a fix makes the EQ deliver more low end, re-measure the low-end gain swing: full delivery turned a 2.5 dB
+    kick-rate wobble into 5 dB. Slow the adaptive part in the bass (>= ~60 cycles), never the user's knobs (Amount).
+31. "CPU spikes at 1.5 %" usually isn't the DSP. Profile per block (min of repeats) AND time a GUI frame. A 30 fps
+    display with gradients and 9 px rounded-join strokes cost 77 % of a core on Retina. Cache static layers, buffer
+    the background, cache blurred shadows, skip frames when nothing moved.
+32. JUCE: setBufferedToImage on a non-opaque child's parent, or every child repaint re-runs the parent's gradients.
+    `Component` already has a member called `flags` - don't name a local that (-Wshadow).
+33. A hosted VST3's getStateInformation is the host wrapper's XML, not the plugin's own state. Test plugin-private
+    state (e.g. a reference curve) in-process.

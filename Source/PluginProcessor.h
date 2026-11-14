@@ -1,6 +1,8 @@
 #pragma once
 #include <juce_audio_utils/juce_audio_utils.h>
 #include "dsp/WaveSurferDSP.h"
+#include <mutex>
+#include <thread>
 
 // ==============================================================================
 // WAVESURFER — audio processor
@@ -13,7 +15,7 @@
 class WaveSurferProcessor : public juce::AudioProcessor, private juce::AsyncUpdater {
 public:
     WaveSurferProcessor();
-    ~WaveSurferProcessor() override = default;
+    ~WaveSurferProcessor() override;
 
     void prepareToPlay(double sampleRate, int samplesPerBlock) override;
     void releaseResources() override {}
@@ -47,6 +49,14 @@ public:
     juce::AudioProcessorValueTreeState apvts;
     static juce::AudioProcessorValueTreeState::ParameterLayout createParameterLayout();
 
+    // ---- Ref Track: load a song, analyse its long-term balance off the audio thread ----------
+    enum class RefStatus { None = 0, Analysing, Ready, Failed };
+    void loadReferenceFile(const juce::File& file);      // message thread; analysis runs on a worker
+    void clearReference();                                // message thread
+    RefStatus getRefStatus() const noexcept { return (RefStatus) refStatus.load(); }
+    juce::String getRefName() const;                      // message thread
+    juce::String getRefError() const;                     // message thread
+
 private:
     wavesurfer::WaveSurferEngine engine;
 
@@ -62,5 +72,18 @@ private:
     int reportedLatency = 0;
     juce::AudioProcessorParameter* bypassParam = nullptr;
 
+    // Ref Track state. The curve lives in apvts.state (saved with the session); refF/refD mirror it
+    // so prepareToPlay can re-map it onto the engine's bands at a new sample rate.
+    void applyReferenceToEngine();
+    void storeReference(const juce::String& name, const std::vector<float>& f, const std::vector<float>& d);
+    void restoreReferenceFromState();
+    std::mutex refMutex;                       // guards refF/refD/refError (never touched by the audio thread)
+    std::vector<float> refF, refD;
+    juce::String refError;
+    std::atomic<int> refStatus { 0 };
+    std::atomic<bool> cancelAnalysis { false };
+    std::thread analysisThread;
+
+    JUCE_DECLARE_WEAK_REFERENCEABLE(WaveSurferProcessor)
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(WaveSurferProcessor)
 };

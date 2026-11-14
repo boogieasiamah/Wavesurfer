@@ -98,6 +98,21 @@ static double kLoudness(const std::vector<float>& L, const std::vector<float>& R
     return -0.691 + 10 * std::log10(kw(L, from) + kw(R, from) + 1e-30);
 }
 
+// Perceived loudness, independent of the engine: 1/6-octave biquad bank, ISO 226 weighting at 80 phon
+static double earLoudness(const std::vector<float>& L, const std::vector<float>& R, int from, double fs = 48000.0) {
+    double tot = 0; const double pi = 3.14159265358979;
+    for (double fc = 20.0; fc < 20000.0; fc *= std::pow(2.0, 1.0 / 6.0)) {
+        const double q = 1.0 / (std::pow(2.0, 1.0 / 12.0) - std::pow(2.0, -1.0 / 12.0)), w = 2 * pi * fc / fs, al = std::sin(w) / (2 * q), a0 = 1 + al;
+        const double b0 = al / a0, b2 = -al / a0, a1 = -2 * std::cos(w) / a0, a2 = (1 - al) / a0;
+        double e = 0;
+        for (const auto* x : { &L, &R }) { double z1 = 0, z2 = 0;
+            for (size_t i = 0; i < x->size(); ++i) { const double in = (*x)[i], y = b0 * in + z1; z1 = -a1 * y + z2; z2 = b2 * in - a2 * y;
+                if ((int) i >= from) e += y * y; } }
+        tot += e * std::pow(10.0, (wavesurfer::iso226SplDb(1000.0, 80.0) - wavesurfer::iso226SplDb(fc, 80.0)) / 10.0);
+    }
+    return 10 * std::log10(tot + 1e-30);
+}
+
 // ================================================================== tests ====
 static void testClipper() {
     std::puts("[T01] soft clipper: unity, continuity, monotonic, ceiling");
@@ -171,6 +186,11 @@ static void testNull() {
     }
 }
 
+static void loadTortureRef(WaveSurferEngine& e) {      // steep, uneven target: worst case for Track mode
+    float f[8] = {20, 60, 200, 700, 2000, 5000, 12000, 20000}, d[8] = {30, -20, 25, -30, 20, -25, 30, -40};
+    e.setReferenceCurve(f, d, 8);
+}
+
 static void testExtremeGrid() {
     std::puts("[T05] all 256 parameter corners x 6 signals x random toggles/modes (finite, bounded, clip ceiling)");
     const float corners[8][2] = { {0,2}, {0,2}, {-1,1}, {-1,1}, {-50,50}, {0,1}, {20,2000}, {1000,20000} };
@@ -182,7 +202,9 @@ static void testExtremeGrid() {
             Params p; float v[8]; for (int k = 0; k < 8; ++k) v[k] = corners[k][(c >> k) & 1];
             p = P(v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7]);
             p.gainMatch = tog.next() > 0; p.delta = tog.next() > 0.6f; p.safetyClip = tog.next() > 0;
-            p.reference = tog.next() > 0 ? Reference::Pink : Reference::Ear; p.lookahead = tog.next() > 0;
+            { const float m = tog.next(); p.reference = m > 0.33f ? Reference::Pink : m > -0.33f ? Reference::Track : Reference::Ear; }
+            if (tog.next() > 0) loadTortureRef(e);
+            p.lookahead = tog.next() > 0;
             p.outputDb = tog.next() > 0 ? 12.0f : -12.0f;
             e.setParameters(p);
             std::vector<float> L, R; gen(s, 48000, 24000, L, R, c + 1); float inPk = std::max(peak(L), peak(R));
@@ -226,7 +248,8 @@ static void testRatesBlocks() {
         std::vector<float> refL, refR;
         for (int bs : blocks) {
             WaveSurferEngine e; e.prepare(fs, bs); Params p = P(1.6f, 1.2f, 0.2f, 0.3f, 10, 1); p.gainMatch = true;
-            p.reference = ri % 2 ? Reference::Pink : Reference::Ear; p.lookahead = ri % 3 == 0;
+            p.reference = ri % 3 == 2 ? Reference::Track : ri % 2 ? Reference::Pink : Reference::Ear; p.lookahead = ri % 3 == 0;
+            loadTortureRef(e);
             e.setParameters(p);
             std::vector<float> L, R; gen(Sig::PinkPlusTone, fs, (int)(fs * 0.6), L, R);
             run(e, L, R, bs); ++total;
@@ -251,7 +274,9 @@ static void testAutomation() {
         Params p = P(r.next() * .5f + .5f, r.next() * .5f + .5f, r.next(), r.next(), r.next() * 12, r.next() * .5f + .5f,
                      20 + (r.next() * .5f + .5f) * 1980, 1000 + (r.next() * .5f + .5f) * 19000);
         p.bypass = r.next() > 0.8f; p.delta = false; p.gainMatch = r.next() > 0;
-        p.reference = r.next() > 0 ? Reference::Pink : Reference::Ear; p.outputDb = 0; e.setParameters(p); });
+        { const float m = r.next(); p.reference = m > 0.33f ? Reference::Pink : m > -0.33f ? Reference::Track : Reference::Ear; }
+        if (r.next() > 0.9f) loadTortureRef(e);
+        p.outputDb = 0; e.setParameters(p); });
     float dOut = maxDiff(L, 4800);
     std::printf("    max step in %.4f, out %.4f (ratio %.2f; boost+EQ allow up to ~%.1fx)\n", dIn, dOut, dOut / dIn, std::pow(10.0, 27 / 20.0));
     CHECK(allFinite(L) && allFinite(R), "non-finite under automation");
@@ -326,9 +351,11 @@ static void testGainMatchDelta() {
       p.gainMatch = true; WaveSurferEngine e; e.prepare(48000); e.setParameters(p);
       auto L = L0, R = R0, L2 = L0, R2 = R0; run(e, L, R, 512); run(u, L2, R2, 512);
       const int from = 48000 * 3;
-      double base = kLoudness(L0, R0, from), dm = kLoudness(L, R, from) - base, du = kLoudness(L2, R2, from) - base;
-      std::printf("    %s: K-weighted loudness change unmatched %+.2f dB, matched %+.2f dB\n", mode ? "pink" : "ear ", du, dm);
+      double base = earLoudness(L0, R0, from), dm = earLoudness(L, R, from) - base, du = earLoudness(L2, R2, from) - base;
+      const double kb = kLoudness(L0, R0, from), km = kLoudness(L, R, from) - kb;
+      std::printf("    %s: perceived loudness change unmatched %+.2f dB, matched %+.2f dB (LUFS %+.2f)\n", mode ? "pink" : "ear ", du, dm, km);
       CHECK(std::abs(dm) < 0.75, "loudness match (%s) off by %.2f dB", mode ? "pink" : "ear", dm);
+      CHECK(std::abs(km) < 3.0, "LUFS moved %.2f dB with loudness match (%s)", km, mode ? "pink" : "ear");
       CHECK(std::abs(du) > std::abs(dm), "loudness match had no effect (%s)", mode ? "pink" : "ear"); }
     { WaveSurferEngine w, d; w.prepare(48000); d.prepare(48000); Params p = P(1, 1, 0, 0.5f, 0, 1); w.setParameters(p); p.delta = true; d.setParameters(p);
       std::vector<float> L, R; gen(Sig::Pink, 48000, 48000 * 2, L, R); auto dry = L; auto L2 = L, R2 = R;
@@ -340,6 +367,86 @@ static void testGainMatchDelta() {
       std::vector<float> L, R; gen(Sig::Pink, 48000, 48000, L, R); R = L; auto M = L, dummy = L;
       run(s, L, R, 512, true); run(m, M, dummy, 512, false);
       CHECK(!std::memcmp(L.data(), M.data(), L.size() * 4), "mono path differs from stereo L=R"); }
+}
+
+static void testNoLowMidLift() {
+    std::puts("[T18] Tame + loudness match must not lift 150-400 Hz (the 'muddy' shift)");
+    const double fs = 48000.0, pi = 3.14159265358979; const int n = (int) (16 * fs);
+    std::vector<float> L(n), R(n); Rng r; double kph = 0, bph = 0;
+    for (int i = 0; i < n; ++i) {   // kick + bass + chords + hats, kick/bass dominate
+        const double t = i / fs, tb = std::fmod(t, 0.5);
+        kph += 2 * pi * (50 + 90 * std::exp(-tb / 0.02)) / fs; bph += 2 * pi * 55.0 / fs;
+        double ch = 0; for (double f0 : { 220.0, 277.2, 329.6 }) for (int h = 1; h <= 6; ++h) ch += std::sin(2 * pi * f0 * h * t) / (h * h * 0.7 + 0.3);
+        const float x = (float) (0.9 * std::sin(kph) * std::exp(-tb / 0.18) + 0.35 * (std::sin(bph) + 0.5 * std::sin(2 * bph)) + 0.045 * ch
+                                 + 0.1 * r.next() * std::exp(-std::fmod(t, 0.25) / 0.03));
+        L[i] = R[i] = 0.25f * x; }
+    auto band = [&](const std::vector<float>& x, double lo, double hi) {
+        const double fc = std::sqrt(lo * hi), q = fc / (hi - lo), w = 2 * pi * fc / fs, al = std::sin(w) / (2 * q), a0 = 1 + al;
+        const double b0 = al / a0, b2 = -al / a0, a1 = -2 * std::cos(w) / a0, a2 = (1 - al) / a0; double e = 0;
+        for (int pass = 0; pass < 1; ++pass) { double z1 = 0, z2 = 0, y1s = 0, y2s = 0; double u1 = 0, u2 = 0; (void) y1s; (void) y2s;
+            for (int i = 0; i < n; ++i) { const double y = b0 * x[i] + z1; z1 = -a1 * y + z2; z2 = b2 * x[i] - a2 * y;
+                const double v = b0 * y + u1; u1 = -a1 * v + u2; u2 = b2 * y - a2 * v; if (i >= n / 2) e += v * v; } }
+        return 10 * std::log10(e + 1e-30); };
+    WaveSurferEngine e; e.prepare(fs); Params p = P(0, 1, 0, 0, 0, 1); p.gainMatch = true; e.setParameters(p);
+    auto Lo = L, Ro = R; run(e, Lo, Ro, 512);
+    const double sub = band(Lo, 20, 60) - band(L, 20, 60), lowMid = band(Lo, 150, 400) - band(L, 150, 400);
+    std::printf("    Tame 100%%: 20-60 Hz %+.2f dB, 150-400 Hz %+.2f dB\n", sub, lowMid);
+    CHECK(lowMid < 0.6, "Tame + loudness match lifted 150-400 Hz by %.2f dB", lowMid);
+}
+
+// RBJ shelf for shaping test signals (type 1 low shelf, 2 high shelf)
+struct Shelf { double b0=1,b1=0,b2=0,a1=0,a2=0,z1=0,z2=0;
+    Shelf(int type, double fs, double f0, double gdb) { const double A = std::pow(10.0, gdb / 40.0), w = 2 * 3.14159265358979 * f0 / fs, cw = std::cos(w), al = std::sin(w) / (2 * 0.7071);
+        const double s2 = 2 * std::sqrt(A) * al, sg = type == 1 ? 1.0 : -1.0;
+        const double B0 = A*((A+1) - sg*(A-1)*cw + s2), B1 = sg*2*A*((A-1) - sg*(A+1)*cw), B2 = A*((A+1) - sg*(A-1)*cw - s2);
+        const double A0 = (A+1) + sg*(A-1)*cw + s2, A1 = -sg*2*((A-1) + sg*(A+1)*cw), A2 = (A+1) + sg*(A-1)*cw - s2;
+        b0 = B0/A0; b1 = B1/A0; b2 = B2/A0; a1 = A1/A0; a2 = A2/A0; }
+    float run(float x) { const double y = b0*x + z1; z1 = b1*x - a1*y + z2; z2 = b2*x - a2*y; return (float) y; } };
+
+static bool analyse(double fs, const std::vector<float>& L, const std::vector<float>& R, float* f, float* d) {
+    WaveSurferEngine a; a.prepare(fs); a.setParameters(Params{}); a.beginAnalysis();
+    auto l = L, r = R; run(a, l, r, 4096); return a.getAnalysis(f, d);
+}
+
+static void testTrack() {
+    std::puts("[T19] Ref Track: analysis calibration, matching toward a reference, rate mapping, garbage curves");
+    float f[32], d[32];
+    { std::vector<float> L, R; gen(Sig::Pink, 48000, 48000 * 20, L, R); analyse(48000, L, R, f, d);
+      float lo = 99, hi = -99; for (int b = 0; b < 32; ++b) if (f[b] > 40 && f[b] < 16000) { lo = std::min(lo, d[b]); hi = std::max(hi, d[b]); }
+      std::printf("    pink noise analyses flat within %.2f dB (40 Hz-16 kHz)\n", hi - lo);
+      CHECK(hi - lo < 2.0f, "pink reference not flat (%.2f dB spread)", hi - lo); }
+    auto shaped = [](double fs, int n, uint64_t seed, double lowDb, double highDb, std::vector<float>& L, std::vector<float>& R) {
+        gen(Sig::Pink, fs, n, L, R, seed); Shelf a(1, fs, 120, lowDb), b(2, fs, 4000, highDb), c(1, fs, 120, lowDb), e2(2, fs, 4000, highDb);
+        for (size_t k = 0; k < L.size(); ++k) { L[k] = 0.5f * b.run(a.run(L[k])); R[k] = 0.5f * e2.run(c.run(R[k])); } };
+    float rf[32], rd[32];
+    { std::vector<float> L, R; shaped(48000, 48000 * 20, 3, 6, -6, L, R); analyse(48000, L, R, rf, rd); }   // reference: warm, dark
+    auto devFrom = [&](const float* x) { double m = 0; int n = 0; for (int b = 0; b < 32; ++b) if (rf[b] > 40 && rf[b] < 12000) { m += x[b] - rd[b]; ++n; } m /= n;
+        double e = 0; for (int b = 0; b < 32; ++b) if (rf[b] > 40 && rf[b] < 12000) e += (x[b] - rd[b] - m) * (x[b] - rd[b] - m); return std::sqrt(e / n); };
+    { std::vector<float> L, R; shaped(48000, 48000 * 24, 9, -4, 4, L, R);            // input: thin and bright
+      float inF[32], inD[32]; analyse(48000, L, R, inF, inD);
+      WaveSurferEngine e; e.prepare(48000); Params p = P(1, 1, 0, 0, 0, 1); p.reference = Reference::Track; e.setReferenceCurve(rf, rd, 32); e.setParameters(p);
+      auto Lo = L, Ro = R; run(e, Lo, Ro, 512);
+      std::vector<float> Lt(Lo.begin() + 48000 * 12, Lo.end()), Rt(Ro.begin() + 48000 * 12, Ro.end());
+      float oF[32], oD[32]; analyse(48000, Lt, Rt, oF, oD);
+      const double before = devFrom(inD), after = devFrom(oD);
+      std::printf("    thin/bright input vs warm/dark reference: balance error %.2f dB -> %.2f dB (Rec/Tame 100%%)\n", before, after);
+      CHECK(after < 0.6 * before, "Track mode didn't move toward the reference (%.2f -> %.2f dB)", before, after); }
+    { std::vector<float> L, R; shaped(44100, 44100 * 20, 3, 6, -6, L, R); float f44[32], d44[32]; analyse(44100, L, R, f44, d44);
+      WaveSurferEngine a, b; a.prepare(96000); b.prepare(96000); a.setReferenceCurve(rf, rd, 32); b.setReferenceCurve(f44, d44, 32);
+      float worst = 0; const auto& sa = a.getSnapshot(); const auto& sb = b.getSnapshot();
+      for (int k = 0; k < 32; ++k) if (a.getBandFreq(k) > 40 && a.getBandFreq(k) < 16000)
+          worst = std::max(worst, std::abs(sa.refTargetDb[(size_t) k].load() - sb.refTargetDb[(size_t) k].load()));
+      std::printf("    same reference analysed at 44.1k vs 48k, used at 96k: max difference %.2f dB\n", worst);
+      CHECK(worst < 1.5f, "reference mapping across rates off by %.2f dB", worst); }
+    { WaveSurferEngine e; e.prepare(48000); Params p = P(2, 2, 0, 0, 0, 1); p.reference = Reference::Track; e.setParameters(p);
+      std::vector<float> L, R; gen(Sig::Pink, 48000, 48000 * 2, L, R); auto L0 = L; run(e, L, R, 512);
+      CHECK(!std::memcmp(L.data(), L0.data(), L.size() * 4), "Track mode without a reference is not a bit-exact pass-through"); }
+    { WaveSurferEngine e; e.prepare(48000); Params p = P(2, 2, 1, 1, 50, 1); p.reference = Reference::Track; e.setParameters(p);
+      const float nan = std::numeric_limits<float>::quiet_NaN(), inf = std::numeric_limits<float>::infinity();
+      float gf[4] = {nan, 100, inf, -5}, gd[4] = {inf, nan, 1e30f, -1e30f}; e.setReferenceCurve(gf, gd, 4);
+      e.setReferenceCurve(gf, gd, 1); e.setReferenceCurve(nullptr, nullptr, 32); e.setReferenceCurve(gf, gd, 4);
+      std::vector<float> L, R; gen(Sig::Hot, 48000, 48000 * 2, L, R); run(e, L, R, 333);
+      CHECK(allFinite(L) && allFinite(R), "garbage reference curve produced non-finite output"); }
 }
 
 static void testEdgeCalls() {
@@ -488,7 +595,7 @@ int main() {
     std::puts("=== WaveSurfer extreme-level quality check ===");
     testClipper(); testKalman(); testIso(); testNull(); testExtremeGrid(); testNaN(); testRatesBlocks();
     testAutomation(); testBehaviour(); testSilenceAfterLoud(); testGainMatchDelta(); testEdgeCalls(); testDenormal(); testLongRun();
-    testPink(); testBiasBrightenBoost(); testLookahead();
+    testPink(); testBiasBrightenBoost(); testLookahead(); testNoLowMidLift(); testTrack();
     benchmark();
     std::printf("\n=== %d checks passed, %d failed ===\n", g_pass, g_fail);
     for (auto& f : g_failures) std::printf("  - %s\n", f.c_str());
